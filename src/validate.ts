@@ -94,8 +94,15 @@ function parseProposal(raw: unknown, rules: ProposalRules): Proposal | string {
   if (raw.kind === "finish") {
     if (!rules.allowFinish) return "finish is not allowed for this agent";
     if (typeof raw.summary !== "string" || !raw.summary.trim()) return "finish needs a summary";
-    if (!isStringArray(raw.evidence) || raw.evidence.length === 0) return "finish needs evidence ids";
-    return { kind: "finish", summary: raw.summary, evidence: raw.evidence };
+    const evidence = raw.evidence ?? [];
+    if (!isStringArray(evidence)) return "finish evidence must be a string array";
+    return { kind: "finish", summary: raw.summary, evidence };
+  }
+  if (raw.kind === "read_record") {
+    if (typeof raw.id !== "string" || !raw.id.trim()) return "read_record needs an id";
+    const offset = raw.offset ?? 0;
+    if (typeof offset !== "number" || !Number.isInteger(offset) || offset < 0) return "read_record offset must be a non-negative integer";
+    return { kind: "read_record", id: raw.id, offset };
   }
   return `unknown kind ${String(raw.kind)}`;
 }

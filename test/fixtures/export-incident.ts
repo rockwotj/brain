@@ -1,20 +1,11 @@
 /**
- * A small fictional scenario used by the demo and the end-to-end tests:
+ * TEST FIXTURE ONLY. A small fictional scenario for end-to-end tests:
  * "Why did last night's nightly-export job fail?" for an imaginary analytics team.
- * The models are scripted (ScriptedLlm) so every run is deterministic.
+ * Models (ScriptedLlm), tools and embeddings are deterministic test doubles.
  */
-import {
-  FunctionTools,
-  Harness,
-  InMemoryEpisodicStore,
-  InMemoryHabitStore,
-  InMemoryKnowledgeStore,
-  ScriptedLlm,
-  type LlmRequest,
-  type ModelProfile,
-  type SpecialistSpec,
-  type ToolSpec,
-} from "../src/index.ts";
+import { FunctionTools, Harness, MemoryStorage, type LlmRequest, type ModelProfile, type SpecialistSpec, type ToolSpec } from "../../src/index.ts";
+import { ScriptedLlm, transcriptText } from "./scripted-llm.ts";
+import { WordHashEmbedder } from "./word-hash-embedder.ts";
 
 export const SYSTEM1: ModelProfile = {
   id: "s1-small", model: "small-fast-model", tier: "system1", reasoningEffort: "none",
@@ -49,7 +40,6 @@ export function makeTools(): FunctionTools {
 }
 
 const reply = (proposals: unknown[]) => JSON.stringify({ proposals });
-const transcriptText = (r: LlmRequest) => r.messages.map((m) => m.content).join("\n");
 
 /** Scripted models. Each agent decides from its own transcript, like a real model would. */
 export function scriptedResponder(r: LlmRequest): string {
@@ -106,25 +96,25 @@ export function scriptedResponder(r: LlmRequest): string {
 }
 
 /** Build a harness with seeded memory: one past episode, one knowledge item, one approved habit. */
-export function makeScenario() {
+export async function makeScenario() {
   const llm = new ScriptedLlm(scriptedResponder);
   const tools = makeTools();
-  const episodes = new InMemoryEpisodicStore();
-  const knowledge = new InMemoryKnowledgeStore();
-  const habits = new InMemoryHabitStore();
-  const past = episodes.append({ goal: "Why did the nightly export fail?", status: "finished", actions: [], answer: "Storage quota was exceeded." });
-  episodes.markConsolidated([past.id]);
-  knowledge.add("Nightly export failures are usually caused by storage quota.", [past.id]);
-  const habit = habits.register({ trigger: "export", call: { tool: "read_job_logs", args: { job: "nightly-export" } }, expect: { success: true }, sources: [past.id] });
-  habits.approve(habit.id);
   const harness = new Harness({
     llm,
     profiles: { system1: SYSTEM1, system2: SYSTEM2 },
     tools: TOOLS,
     toolPort: tools,
     specialists: SPECIALISTS,
-    memory: { episodes, knowledge, habits },
+    storage: new MemoryStorage(),
+    embedder: new WordHashEmbedder(),
+    recall: { minSimilarity: 0.1 },
   });
+  const { episodes, knowledge, habits } = harness;
+  const past = await episodes.append({ goal: "Why did the nightly export fail?", status: "finished", actions: [], answer: "Storage quota was exceeded." });
+  await episodes.markConsolidated([past.id]);
+  await knowledge.add("Nightly export failures are usually caused by storage quota.", [past.id]);
+  const habit = await habits.register({ trigger: "export", call: { tool: "read_job_logs", args: { job: "nightly-export" } }, expect: { success: true }, sources: [past.id] });
+  await habits.approve(habit.id);
   return { llm, tools, harness, episodes, knowledge, habits };
 }
 

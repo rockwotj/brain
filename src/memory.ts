@@ -1,116 +1,142 @@
 /**
- * Two-speed memory behind ports, with in-memory implementations:
- *  - EpisodicStore: fast, append-only record of whole runs (written live).
+ * Two-speed memory on the async Storage port:
+ *  - EpisodicStore: fast, append-only record of whole turns (written live).
  *  - KnowledgeStore: slow, consolidated statements with provenance (written only by consolidation).
- *  - HabitStore: approved situation -> action shortcuts (registered pending, approved by a human).
+ *  - HabitStore: situation -> action shortcuts (registered pending, approved by a human).
+ *
+ * Recall uses an injected Embedder: items are embedded when written and ranked
+ * by cosine similarity to the cue (brute force; fine for a PoC). Without an
+ * embedder there is no recall: no keyword fallback pretends to be semantic.
  */
+import { cosine, embedOne, type Embedder } from "./io/embeddings.ts";
+import type { Storage } from "./io/storage.ts";
 import type { Episode, Habit, KnowledgeItem, Prediction, ToolCall } from "./types.ts";
 
-export interface EpisodicStore {
-  append(episode: Omit<Episode, "id" | "consolidated">): Episode;
-  get(id: string): Episode | undefined;
-  list(): Episode[];
-  recall(cue: string, limit: number): Episode[];
-  markConsolidated(ids: readonly string[]): void;
+type Stored<T> = { item: T; embedding?: number[] };
+export type RecallOptions = { limit: number; minSimilarity: number };
+
+/** Items with ids like `ep-3`, stored under keys like `episodes/000003`. */
+class Collection<T extends { id: string }> {
+  constructor(
+    private readonly storage: Storage,
+    private readonly prefix: string,
+    private readonly idPrefix: string,
+  ) {}
+
+  async nextId(): Promise<string> {
+    return `${this.idPrefix}-${(await this.storage.keys(this.prefix)).length + 1}`;
+  }
+  async get(id: string): Promise<Stored<T> | undefined> {
+    return this.storage.get<Stored<T>>(this.key(id));
+  }
+  async put(entry: Stored<T>): Promise<void> {
+    await this.storage.put(this.key(entry.item.id), entry);
+  }
+  async all(): Promise<Stored<T>[]> {
+    const keys = await this.storage.keys(this.prefix);
+    const entries = await Promise.all(keys.map((k) => this.storage.get<Stored<T>>(k)));
+    return entries.filter((e): e is Stored<T> => !!e);
+  }
+  private key(id: string): string {
+    const n = Number(id.slice(this.idPrefix.length + 1));
+    if (!id.startsWith(`${this.idPrefix}-`) || !Number.isInteger(n)) throw new Error(`not a ${this.idPrefix} id: ${id}`);
+    return `${this.prefix}${String(n).padStart(6, "0")}`;
+  }
 }
 
-export interface KnowledgeStore {
-  add(statement: string, sources: readonly string[]): KnowledgeItem;
-  list(): KnowledgeItem[];
-  recall(cue: string, limit: number): KnowledgeItem[];
+/** Top matches by cosine similarity. Items without a comparable embedding are skipped. */
+function rank<T>(entries: readonly Stored<T>[], cue: readonly number[], opts: RecallOptions): T[] {
+  return entries
+    .flatMap((e) => (e.embedding && e.embedding.length === cue.length ? [{ item: e.item, score: cosine(cue, e.embedding) }] : []))
+    .filter((x) => x.score >= opts.minSimilarity)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, opts.limit)
+    .map((x) => x.item);
 }
 
-export interface HabitStore {
-  register(draft: { trigger: string; call: ToolCall; expect: Prediction; sources: string[] }): Habit;
-  approve(id: string): void;
-  /** Approved habits whose trigger appears in the goal. */
-  match(goal: string): Habit[];
-  recordOutcome(id: string, ok: boolean): void;
-  list(): Habit[];
-}
-
-export class InMemoryEpisodicStore implements EpisodicStore {
-  private readonly episodes: Episode[] = [];
-  append(draft: Omit<Episode, "id" | "consolidated">): Episode {
-    const episode = { ...draft, id: `ep-${this.episodes.length + 1}`, consolidated: false };
-    this.episodes.push(episode);
+export class EpisodicStore {
+  private readonly items: Collection<Episode>;
+  constructor(storage: Storage, private readonly embedder?: Embedder) {
+    this.items = new Collection(storage, "episodes/", "ep");
+  }
+  async append(draft: Omit<Episode, "id" | "consolidated">): Promise<Episode> {
+    const episode: Episode = { ...draft, id: await this.items.nextId(), consolidated: false };
+    const embedding = this.embedder ? await embedOne(this.embedder, `${episode.goal}\n${episode.answer ?? ""}`) : undefined;
+    await this.items.put({ item: episode, ...(embedding ? { embedding } : {}) });
     return episode;
   }
-  get(id: string): Episode | undefined {
-    return this.episodes.find((e) => e.id === id);
+  async get(id: string): Promise<Episode | undefined> {
+    return (await this.items.get(id))?.item;
   }
-  list(): Episode[] {
-    return [...this.episodes];
+  async list(): Promise<Episode[]> {
+    return (await this.items.all()).map((e) => e.item);
   }
-  recall(cue: string, limit: number): Episode[] {
-    return rankByOverlap(this.episodes, cue, (e) => `${e.goal} ${e.answer ?? ""}`, limit);
+  async recall(cue: readonly number[], opts: RecallOptions): Promise<Episode[]> {
+    return rank(await this.items.all(), cue, opts);
   }
-  markConsolidated(ids: readonly string[]): void {
-    for (const e of this.episodes) if (ids.includes(e.id)) e.consolidated = true;
+  async markConsolidated(ids: readonly string[]): Promise<void> {
+    for (const id of ids) {
+      const entry = await this.items.get(id);
+      if (entry) await this.items.put({ ...entry, item: { ...entry.item, consolidated: true } });
+    }
   }
 }
 
-export class InMemoryKnowledgeStore implements KnowledgeStore {
-  private readonly items: KnowledgeItem[] = [];
-  add(statement: string, sources: readonly string[]): KnowledgeItem {
+export class KnowledgeStore {
+  private readonly items: Collection<KnowledgeItem>;
+  constructor(storage: Storage, private readonly embedder?: Embedder) {
+    this.items = new Collection(storage, "knowledge/", "kn");
+  }
+  /** Adds a statement, or merges provenance into an identical existing one. */
+  async add(statement: string, sources: readonly string[]): Promise<KnowledgeItem> {
     if (!sources.length) throw new Error("knowledge requires provenance");
-    const existing = this.items.find((k) => k.statement.toLowerCase() === statement.toLowerCase());
+    const existing = (await this.items.all()).find((e) => e.item.statement.toLowerCase() === statement.toLowerCase());
     if (existing) {
-      existing.sources = [...new Set([...existing.sources, ...sources])];
-      existing.version++;
-      return existing;
+      const item = { ...existing.item, sources: [...new Set([...existing.item.sources, ...sources])], version: existing.item.version + 1 };
+      await this.items.put({ ...existing, item });
+      return item;
     }
-    const item = { id: `kn-${this.items.length + 1}`, statement, sources: [...sources], version: 1 };
-    this.items.push(item);
+    const item: KnowledgeItem = { id: await this.items.nextId(), statement, sources: [...sources], version: 1 };
+    const embedding = this.embedder ? await embedOne(this.embedder, statement) : undefined;
+    await this.items.put({ item, ...(embedding ? { embedding } : {}) });
     return item;
   }
-  list(): KnowledgeItem[] {
-    return [...this.items];
+  async list(): Promise<KnowledgeItem[]> {
+    return (await this.items.all()).map((e) => e.item);
   }
-  recall(cue: string, limit: number): KnowledgeItem[] {
-    return rankByOverlap(this.items, cue, (k) => k.statement, limit);
+  async recall(cue: readonly number[], opts: RecallOptions): Promise<KnowledgeItem[]> {
+    return rank(await this.items.all(), cue, opts);
   }
 }
 
-export class InMemoryHabitStore implements HabitStore {
-  private readonly habits: Habit[] = [];
-  register(draft: { trigger: string; call: ToolCall; expect: Prediction; sources: string[] }): Habit {
-    const habit: Habit = { ...draft, id: `hb-${this.habits.length + 1}`, status: "pending", successes: 0, failures: 0 };
-    this.habits.push(habit);
+export class HabitStore {
+  private readonly items: Collection<Habit>;
+  constructor(storage: Storage) {
+    this.items = new Collection(storage, "habits/", "hb");
+  }
+  async register(draft: { trigger: string; call: ToolCall; expect: Prediction; sources: string[] }, status: Habit["status"] = "pending"): Promise<Habit> {
+    const habit: Habit = { ...draft, id: await this.items.nextId(), status, successes: 0, failures: 0 };
+    await this.items.put({ item: habit });
     return habit;
   }
-  approve(id: string): void {
-    const habit = this.habits.find((h) => h.id === id);
-    if (!habit) throw new Error(`unknown habit ${id}`);
-    habit.status = "approved";
+  async approve(id: string): Promise<void> {
+    await this.update(id, (h) => ({ ...h, status: "approved" }));
   }
-  match(goal: string): Habit[] {
+  /** Approved habits whose trigger phrase appears in the goal (case-insensitive). */
+  async match(goal: string): Promise<Habit[]> {
     const g = goal.toLowerCase();
-    return this.habits.filter((h) => h.status === "approved" && g.includes(h.trigger.toLowerCase()));
+    return (await this.list()).filter((h) => h.status === "approved" && g.includes(h.trigger.toLowerCase()));
   }
   /** A surprising outcome suspends the habit until a human re-approves it. */
-  recordOutcome(id: string, ok: boolean): void {
-    const habit = this.habits.find((h) => h.id === id);
-    if (!habit) return;
-    if (ok) habit.successes++;
-    else {
-      habit.failures++;
-      habit.status = "suspended";
-    }
+  async recordOutcome(id: string, ok: boolean): Promise<void> {
+    await this.update(id, (h) => (ok ? { ...h, successes: h.successes + 1 } : { ...h, failures: h.failures + 1, status: "suspended" }));
   }
-  list(): Habit[] {
-    return [...this.habits];
+  async list(): Promise<Habit[]> {
+    return (await this.items.all()).map((e) => e.item);
   }
-}
-
-/** Naive keyword-overlap retrieval; swap for embeddings behind the same port. */
-function rankByOverlap<T>(items: readonly T[], cue: string, text: (item: T) => string, limit: number): T[] {
-  const words = (s: string) => new Set(s.toLowerCase().match(/[a-z0-9]{4,}/g) ?? []);
-  const cueWords = words(cue);
-  return items
-    .map((item) => ({ item, score: [...words(text(item))].filter((w) => cueWords.has(w)).length }))
-    .filter((x) => x.score > 0)
-    .sort((a, b) => b.score - a.score)
-    .slice(0, limit)
-    .map((x) => x.item);
+  private async update(id: string, change: (h: Habit) => Habit): Promise<void> {
+    const entry = await this.items.get(id);
+    if (!entry) throw new Error(`unknown habit ${id}`);
+    await this.items.put({ item: change(entry.item) });
+  }
 }

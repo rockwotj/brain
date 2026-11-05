@@ -5,7 +5,11 @@
 import type { ActionRecord, Prediction } from "./types.ts";
 import type { ToolResult } from "./tools.ts";
 
-export type EscalationReason = "novelty" | "conflict" | "surprise" | "stall";
+/**
+ * follow_up = the executive asked to read a record and has not seen it yet.
+ * media = images arrived that only the executive's model can see.
+ */
+export type EscalationReason = "novelty" | "conflict" | "surprise" | "stall" | "follow_up" | "media";
 
 /** Surprise = the outcome contradicts the prediction (success flag or expected content). */
 export function isSurprise(predicted: Prediction, actual: ToolResult): boolean {

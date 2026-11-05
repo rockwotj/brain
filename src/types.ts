@@ -1,4 +1,5 @@
 /** Shared domain types. Plain data only: no behaviour lives here. */
+import type { MediaPart } from "./io/content.ts";
 
 export type Json = string | number | boolean | null | Json[] | { [key: string]: Json };
 export type JsonObject = { [key: string]: Json };
@@ -48,8 +49,14 @@ export type ObservationProposal = {
   confidence: Confidence;
 };
 export type ActionProposal = { kind: "action"; call: ToolCall; rationale: string; expect: Prediction };
+/** `evidence: []` is an answer-only finish (no tool evidence needed or available). */
 export type FinishProposal = { kind: "finish"; summary: string; evidence: string[] };
-export type Proposal = ObservationProposal | ActionProposal | FinishProposal;
+/** Ask to see a stored action record in full (delivered privately to the asking agent). */
+export type RecordReadProposal = { kind: "read_record"; id: string; offset: number };
+export type Proposal = ObservationProposal | ActionProposal | FinishProposal | RecordReadProposal;
+
+/** verified = cites a successful action record; answer_only = no tool evidence. */
+export type Completion = "verified" | "answer_only";
 
 /** One executed (or attempted) tool call with its prediction and actual outcome. */
 export type ActionRecord = {
@@ -62,20 +69,30 @@ export type ActionRecord = {
   surprise: boolean;
 };
 
+/**
+ * What a LiveModel reported about one audio/video input, collected into one
+ * record. External perception: citable evidence, but never "verified" like a tool result.
+ */
+export type PerceptionRecord = { id: string; source: string; medium: "audio" | "video"; mimeType: string; observations: string[] };
+
 export type Delta =
-  | { type: "goal.set"; goal: string }
-  | { type: "goal.done"; summary: string; evidence: string[] }
+  | { type: "goal.set"; goal: string; attachments?: MediaPart[] }
+  | { type: "goal.done"; summary: string; evidence: string[]; completion: Completion }
   | { type: "constraint.add"; constraint: Constraint }
   | { type: "constraint.remove"; id: string }
   | { type: "workspace.admit"; item: WorkspaceItem }
   | { type: "workspace.evict"; id: string; reason: string }
   | { type: "action.outcome"; record: ActionRecord }
   | { type: "action.blocked"; call: ToolCall; reason: string }
+  | { type: "perception"; record: PerceptionRecord }
   | { type: "mode.set"; mode: Mode }
   | { type: "note"; text: string };
 
-/** A delta stamped with its position in the append-only event log. */
-export type HarnessEvent = { seq: number; source: string; delta: Delta };
+/**
+ * A delta stamped with its position in the append-only event log.
+ * `audience` limits which agents see it (absent = broadcast to everyone).
+ */
+export type HarnessEvent = { seq: number; source: string; delta: Delta; audience?: string[] };
 
 export type Episode = {
   id: string;

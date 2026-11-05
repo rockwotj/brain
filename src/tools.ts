@@ -14,8 +14,9 @@ export interface ToolPort {
   invoke(call: ToolCall, signal?: AbortSignal): Promise<ToolResult>;
 }
 
-/** In-memory tool port backed by plain functions. Throwing = tool error. */
+/** Real tool port that dispatches to plain (sync or async) functions. Throwing = tool error. */
 export class FunctionTools implements ToolPort {
+  /** Every call received, in order (an audit log). */
   readonly calls: ToolCall[] = [];
   constructor(private readonly handlers: Record<string, (args: JsonObject) => string | Promise<string>>) {}
   async invoke(call: ToolCall): Promise<ToolResult> {
@@ -64,7 +65,8 @@ export function validateArgs(spec: ToolSpec, args: JsonObject): string | undefin
 
 export function renderToolSchemas(specs: readonly ToolSpec[]): string {
   if (!specs.length) return "TOOLS: none. You cannot propose actions.";
-  const lines = specs.map((s) => {
+  // Sorted so the text is byte-identical regardless of registration order (cache-friendly).
+  const lines = [...specs].sort((a, b) => a.name.localeCompare(b.name)).map((s) => {
     const params = Object.entries(s.params)
       .map(([k, p]) => `${k}${p.optional ? "?" : ""}: ${p.type} — ${p.description}`)
       .join("; ");
@@ -73,11 +75,10 @@ export function renderToolSchemas(specs: readonly ToolSpec[]): string {
   return ["TOOLS (effects are enforced by the runtime):", ...lines].join("\n");
 }
 
-export type Execution = { kind: "executed"; record: ActionRecord } | { kind: "blocked"; reason: string };
+export type Execution = { kind: "executed"; record: ActionRecord; effect: Effect } | { kind: "blocked"; reason: string };
 
 export class Actuator {
   private readonly specs: Map<string, ToolSpec>;
-  private nextId = 1;
 
   constructor(
     specs: readonly ToolSpec[],
@@ -98,7 +99,7 @@ export class Actuator {
   /** Re-checks policy immediately before running, regardless of who proposed the call. */
   async execute(
     call: ToolCall,
-    meta: { step: number; source: string; predicted: Prediction; constraints: readonly Constraint[] },
+    meta: { id: string; step: number; source: string; predicted: Prediction; constraints: readonly Constraint[] },
     signal?: AbortSignal,
   ): Promise<Execution> {
     const decision = this.check(call, meta.constraints);
@@ -111,7 +112,7 @@ export class Actuator {
       actual = { ok: false, error: error instanceof Error ? error.message : String(error) };
     }
     const record: ActionRecord = {
-      id: `act-${this.nextId++}`,
+      id: meta.id,
       step: meta.step,
       call,
       source: meta.source,
@@ -119,6 +120,6 @@ export class Actuator {
       actual,
       surprise: isSurprise(meta.predicted, actual),
     };
-    return { kind: "executed", record };
+    return { kind: "executed", record, effect: decision.spec.effect };
   }
 }
