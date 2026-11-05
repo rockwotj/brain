@@ -2,6 +2,7 @@
 // imported from their own paths so the core never pulls in fetch/fs code.
 export * from "./io/content.ts";
 export * from "./io/llm.ts";
+export * from "./io/decision.ts";
 export * from "./io/embeddings.ts";
 export * from "./io/live.ts";
 export * from "./io/storage.ts";

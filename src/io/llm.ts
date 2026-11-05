@@ -8,21 +8,25 @@ import { describeMedia, type ContentPart } from "./content.ts";
 export type Message = { role: "system" | "user" | "assistant"; content: string | readonly ContentPart[] };
 
 /**
- * Abstract model profile. `tier` + `reasoningEffort` describe *how much thinking*;
- * `serviceMode` is a separate provider latency/priority option (e.g. a "fast" lane)
- * and does not change the model's capability.
+ * Abstract profile of a generative model. Three independent settings:
+ *  - `tier`: the model class, "fast" (small, cheap) or "reasoning" (deliberate);
+ *  - `reasoningEffort`: how much the model thinks per call;
+ *  - `serviceMode`: a provider latency/priority lane ("standard", "fast",
+ *    "ultrafast"). It changes how quickly a request is served, not the model.
+ *    Adapters map lanes only to provider options they are configured with.
  */
 export type ModelProfile = {
   id: string;
   model: string;
-  tier: "system1" | "system2";
+  tier: "fast" | "reasoning";
   reasoningEffort: "none" | "low" | "medium" | "high";
-  serviceMode: "standard" | "fast";
+  serviceMode: ServiceMode;
   contextWindow: number;
   maxOutputTokens: number;
   /** The model accepts image parts. Audio/video never go to chat models. */
   vision?: boolean;
 };
+export type ServiceMode = "standard" | "fast" | "ultrafast";
 
 export type LlmRequest = {
   /** Which harness agent is calling (for logging / per-agent caching). */
@@ -77,20 +81,24 @@ export function estimateMessages(messages: readonly Message[], estimate: TokenEs
   }, 0);
 }
 
-export type Profiles = { system1: ModelProfile; system2: ModelProfile; narrator?: ModelProfile };
+/** `fast` serves specialists (and the narrator by default); `reasoning` serves the executive. */
+export type Profiles = { fast: ModelProfile; reasoning: ModelProfile; narrator?: ModelProfile };
 export type AgentRole = "specialist" | "executive" | "narrator";
 
 /**
  * The one place that picks a model per role. Specialists and the narrator use
- * the cheap System 1 profile, the executive the System 2 profile. Each agent
- * keeps its profile for life (a transcript never changes model mid-stream);
- * per call, `withUrgency` may only switch the provider service lane.
+ * the fast profile, the executive the reasoning profile. Each agent keeps its
+ * profile for life (a transcript never changes model mid-stream); per call,
+ * `withUrgency` may only switch the provider service lane.
  */
 export function chooseProfile(profiles: Profiles, role: AgentRole): ModelProfile {
-  return role === "executive" ? profiles.system2 : role === "narrator" ? (profiles.narrator ?? profiles.system1) : profiles.system1;
+  return role === "executive" ? profiles.reasoning : role === "narrator" ? (profiles.narrator ?? profiles.fast) : profiles.fast;
 }
 
-/** Urgency changes the provider service lane only, never the model, tier or effort. */
+/**
+ * Urgency changes the provider service lane only, never the model, tier or effort.
+ * High urgency raises "standard" to "fast"; "fast" and "ultrafast" stay as they are.
+ */
 export function withUrgency(profile: ModelProfile, urgency: "normal" | "high"): ModelProfile {
-  return urgency === "high" && profile.serviceMode !== "fast" ? { ...profile, serviceMode: "fast" } : profile;
+  return urgency === "high" && profile.serviceMode === "standard" ? { ...profile, serviceMode: "fast" } : profile;
 }

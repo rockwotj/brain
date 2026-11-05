@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { consolidate, EpisodicStore, FunctionTools, HabitStore, idle, KnowledgeStore, MemoryStorage } from "../src/index.ts";
-import { GOAL, makeScenario, READ_ONLY, SYSTEM1, SYSTEM2, TOOLS } from "./fixtures/export-incident.ts";
+import { GOAL, makeScenario, READ_ONLY, FAST, REASONING, TOOLS } from "./fixtures/export-incident.ts";
 import { ScriptedLlm } from "./fixtures/scripted-llm.ts";
 import { WordHashEmbedder } from "./fixtures/word-hash-embedder.ts";
 import { build, reply } from "./helpers.ts";
@@ -10,7 +10,7 @@ describe("consolidation", () => {
     const { harness, llm, episodes, knowledge, habits } = await makeScenario();
     const run = await harness.run({ input: GOAL, constraints: [{ ...READ_ONLY }] });
     const before = (await knowledge.list()).length;
-    const report = await consolidate({ llm, profile: SYSTEM2, episodes, knowledge, habits, tools: TOOLS });
+    const report = await consolidate({ llm, profile: REASONING, episodes, knowledge, habits, tools: TOOLS });
 
     expect(report.replayed).toEqual([run.episode.id]);
     expect(report.learned).toHaveLength(1);
@@ -23,7 +23,7 @@ describe("consolidation", () => {
 
     // Nothing left to replay: a second pass is a no-op and makes no model call.
     const calls = llm.requests.length;
-    expect((await consolidate({ llm, profile: SYSTEM2, episodes, knowledge, habits, tools: TOOLS })).replayed).toEqual([]);
+    expect((await consolidate({ llm, profile: REASONING, episodes, knowledge, habits, tools: TOOLS })).replayed).toEqual([]);
     expect(llm.requests.length).toBe(calls);
   });
 
@@ -36,7 +36,7 @@ describe("consolidation", () => {
     });
     const llm = new ScriptedLlm(() => JSON.stringify({ lessons: [], habits: [{ trigger: "x", tool: "check_quota", args: { nope: 1 }, episodes: [surprising.id] }] }));
     const storage = new MemoryStorage();
-    const report = await consolidate({ llm, profile: SYSTEM2, episodes, knowledge: new KnowledgeStore(storage), habits: new HabitStore(storage), tools: TOOLS, maxEpisodes: 1 });
+    const report = await consolidate({ llm, profile: REASONING, episodes, knowledge: new KnowledgeStore(storage), habits: new HabitStore(storage), tools: TOOLS, maxEpisodes: 1 });
     expect(report.replayed).toEqual([surprising.id]);
     expect((await episodes.get(calm.id))!.consolidated).toBe(false);
     expect(report.rejected[0]).toContain("unexpected argument nope");
@@ -50,7 +50,7 @@ describe("consolidation", () => {
       { trigger: "export", tool: "restart_job", args: { job: "j" }, episodes: [ep.id] },
     ] });
     const habits = new HabitStore(new MemoryStorage());
-    const report = await consolidate({ llm: new ScriptedLlm(script), profile: SYSTEM2, episodes, knowledge: new KnowledgeStore(new MemoryStorage()), habits, tools: TOOLS, autoApproveReadOnlyHabits: true });
+    const report = await consolidate({ llm: new ScriptedLlm(script), profile: REASONING, episodes, knowledge: new KnowledgeStore(new MemoryStorage()), habits, tools: TOOLS, autoApproveReadOnlyHabits: true });
     expect(report.habitsProposed.map((h) => [h.call.tool, h.status])).toEqual([["get_input_stats", "approved"], ["restart_job", "pending"]]);
   });
 
@@ -92,7 +92,7 @@ describe("idle background mind", () => {
       { kind: "action", tool: "restart_job", args: { job: "x" } },
     ));
     const storage = new MemoryStorage();
-    const report = await idle({ llm, profile: SYSTEM1, knowledge: new KnowledgeStore(storage), episodes: new EpisodicStore(storage), maxIdeas: 2 });
+    const report = await idle({ llm, profile: FAST, knowledge: new KnowledgeStore(storage), episodes: new EpisodicStore(storage), maxIdeas: 2 });
     expect(report.ideas).toEqual(["idea one", "idea two"]);
     expect(report.discarded.some((d) => d.includes("actions are not allowed"))).toBe(true);
     expect(report.discarded.some((d) => d.includes("idea three"))).toBe(true);

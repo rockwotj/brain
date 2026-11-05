@@ -1,7 +1,7 @@
 {
   "name": "brain-harness",
-  "version": "0.2.0",
-  "description": "Proof-of-concept LLM agent harness: bounded workspace, cheap parallel specialists, an on-demand executive, a policy-gated actuator, cache-stable transcripts and two-speed memory behind provider-neutral IO ports.",
+  "version": "0.3.0",
+  "description": "Proof-of-concept LLM agent harness: bounded workspace, parallel specialists on a fast model, an on-demand reasoning executive, optional decision-model routing, a policy-gated actuator, cache-stable transcripts and two-speed memory behind provider-neutral IO ports.",
   "private": true,
   "type": "module",
   "main": "./src/index.ts",

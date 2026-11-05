@@ -8,8 +8,9 @@ import type { ToolResult } from "./tools.ts";
 /**
  * follow_up = the executive asked to read a record and has not seen it yet.
  * media = images arrived that only the executive's model can see.
+ * judged = the decision model judged that the situation needs the executive.
  */
-export type EscalationReason = "novelty" | "conflict" | "surprise" | "stall" | "follow_up" | "media";
+export type EscalationReason = "novelty" | "conflict" | "surprise" | "stall" | "follow_up" | "media" | "judged";
 
 /** Surprise = the outcome contradicts the prediction (success flag or expected content). */
 export function isSurprise(predicted: Prediction, actual: ToolResult): boolean {

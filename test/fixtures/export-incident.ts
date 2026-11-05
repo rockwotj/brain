@@ -7,12 +7,12 @@ import { FunctionTools, Harness, MemoryStorage, type LlmRequest, type ModelProfi
 import { ScriptedLlm, transcriptText } from "./scripted-llm.ts";
 import { WordHashEmbedder } from "./word-hash-embedder.ts";
 
-export const SYSTEM1: ModelProfile = {
-  id: "s1-small", model: "small-fast-model", tier: "system1", reasoningEffort: "none",
+export const FAST: ModelProfile = {
+  id: "fast-small", model: "small-fast-model", tier: "fast", reasoningEffort: "none",
   serviceMode: "standard", contextWindow: 8_000, maxOutputTokens: 400,
 };
-export const SYSTEM2: ModelProfile = {
-  id: "s2-reasoner", model: "large-reasoning-model", tier: "system2", reasoningEffort: "high",
+export const REASONING: ModelProfile = {
+  id: "reasoner", model: "large-reasoning-model", tier: "reasoning", reasoningEffort: "high",
   serviceMode: "standard", contextWindow: 32_000, maxOutputTokens: 2_000,
 };
 
@@ -101,7 +101,7 @@ export async function makeScenario() {
   const tools = makeTools();
   const harness = new Harness({
     llm,
-    profiles: { system1: SYSTEM1, system2: SYSTEM2 },
+    profiles: { fast: FAST, reasoning: REASONING },
     tools: TOOLS,
     toolPort: tools,
     specialists: SPECIALISTS,

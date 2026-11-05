@@ -1,7 +1,7 @@
-/** Behaviour added by the converged design: sessions, evidence, routing, completion, media. */
+/** Sessions, evidence, outcome routing, completion and media input. */
 import { describe, expect, test } from "bun:test";
 import { buildSharedPrompt, FunctionTools, UnsupportedContentError, type LiveModel, type LlmRequest, type MediaPart } from "../src/index.ts";
-import { SYSTEM1, SYSTEM2, TOOLS } from "./fixtures/export-incident.ts";
+import { FAST, REASONING, TOOLS } from "./fixtures/export-incident.ts";
 import { lastText, transcriptText } from "./fixtures/scripted-llm.ts";
 import { build, isPrefix, narration, reply } from "./helpers.ts";
 
@@ -118,7 +118,7 @@ describe("evidence and routing", () => {
 
   test("long outputs are previewed; read_record delivers chunks privately, also after compaction", async () => {
     const toolPort = new FunctionTools({ read_job_logs: () => LONG });
-    const small = { ...SYSTEM1, contextWindow: 2_600, maxOutputTokens: 300 };
+    const small = { ...FAST, contextWindow: 2_600, maxOutputTokens: 300 };
     const { harness, llm } = build((r) => {
       if (r.agent !== "triage") return reply();
       const seen = lastText(r);
@@ -126,7 +126,7 @@ describe("evidence and routing", () => {
       if (seen.includes("[more: read_record act-1 offset 6000]")) return reply({ kind: "read_record", id: "act-1", offset: 6_000 });
       if (seen.includes("read_record act-1")) return reply({ kind: "read_record", id: "act-1" });
       return reply({ kind: "action", tool: "read_job_logs", args: { job: "j" } });
-    }, { specialists: two, toolPort, profiles: { system1: small, system2: SYSTEM2 } });
+    }, { specialists: two, toolPort, profiles: { fast: small, reasoning: REASONING } });
     const result = await harness.run({ input: "read the log" });
     expect(result.status).toBe("finished");
     const triage = llm.requests.filter((r) => r.agent === "triage").map(lastText);
@@ -156,7 +156,7 @@ describe("media input", () => {
     const { harness, llm, tools } = build((r) => (r.agent === "executive"
       ? reply({ kind: "observation", type: "focus", content: "The screenshot shows a timeout error.", evidence: [], confidence: "high" })
       : reply({ kind: "action", tool: "restart_job", args: { job: "j" } })),
-    { specialists: two, profiles: { system1: SYSTEM1, system2: { ...SYSTEM2, vision: true } }, limits: { maxSteps: 1 } });
+    { specialists: two, profiles: { fast: FAST, reasoning: { ...REASONING, vision: true } }, limits: { maxSteps: 1 } });
     const result = await harness.run({ input: [{ type: "text", text: "what is wrong here?" }, IMAGE] });
     const exec = llm.requests.find((r) => r.agent === "executive")!;
     expect(hasMedia(exec)).toBe(true);
@@ -174,7 +174,7 @@ describe("media input", () => {
     await expect(harness.run({ input: [{ type: "image", mimeType: "image/png" }] })).rejects.toThrow("needs base64 data or a url");
   });
 
-  const visionExec = { system1: SYSTEM1, system2: { ...SYSTEM2, vision: true } };
+  const visionExec = { fast: FAST, reasoning: { ...REASONING, vision: true } };
   const blindAction = () => reply({ kind: "action", tool: "restart_job", args: { job: "j" } });
 
   test("executive-only images with no executive budget are a configuration error", async () => {
@@ -219,7 +219,7 @@ describe("media input", () => {
     const live: LiveModel = {
       name: "test-live",
       async *observe(media, focus) {
-        for (let i = 1; i <= 20; i++) yield `${media.type} note ${i} (focus: ${focus})`;
+        for await (const chunk of media) for (let i = 1; i <= 20; i++) yield `${chunk.type} note ${i} (focus: ${focus})`;
       },
     };
     const { harness, llm } = build((r) => (r.agent === "triage" && lastText(r).includes("RECORD per-1")
@@ -233,5 +233,48 @@ describe("media input", () => {
     expect(llm.requests.some((r) => lastText(r).includes("audio note 12 (focus: listen)"))).toBe(true);
     // Perception is citable, but it is not a verified tool result.
     expect(result.completion).toBe("answer_only");
+  });
+  // TEST FIXTURE: a LiveModel double that turns each input chunk into one observation.
+  const perChunk: LiveModel = {
+    name: "test-live",
+    async *observe(media) {
+      for await (const chunk of media) yield `heard ${chunk.mimeType} chunk`;
+    },
+  };
+
+  test("a live source is read lazily and closed once the observation bound is reached", async () => {
+    let pulled = 0;
+    let closed = false;
+    async function* microphone(): AsyncGenerator<MediaPart> {
+      try {
+        while (true) {
+          pulled++;
+          yield { type: "audio", mimeType: "audio/pcm", base64: "AAAA" };
+        }
+      } finally {
+        closed = true;
+      }
+    }
+    const { harness, llm } = build(() => reply(), { live: perChunk, limits: { maxLiveObservations: 3, maxSteps: 1 } });
+    const session = await harness.openSession();
+    const result = await session.turn({ input: "listen", live: [{ medium: "audio", mimeType: "audio/pcm", chunks: microphone() }] });
+    expect(pulled).toBe(3);
+    expect(closed).toBe(true);
+    expect(result.state.perceptions.get("per-1")).toMatchObject({ medium: "audio", mimeType: "audio/pcm", observations: Array(3).fill("heard audio/pcm chunk") });
+    expect(llm.requests.some((r) => transcriptText(r).includes("per-1"))).toBe(true);
+  });
+
+  test("cancelling while a live source waits for input ends the turn as cancelled", async () => {
+    const controller = new AbortController();
+    async function* stalled(): AsyncGenerator<MediaPart> {
+      yield { type: "audio", mimeType: "audio/pcm", base64: "AAAA" };
+      setTimeout(() => controller.abort(), 5);
+      await new Promise(() => {}); // a source that never sends more
+    }
+    const { harness, llm, tools } = build(() => reply(), { live: perChunk });
+    const result = await harness.run({ input: "listen", live: [{ medium: "audio", mimeType: "audio/pcm", chunks: stalled() }], signal: controller.signal });
+    expect(result.status).toBe("cancelled");
+    expect(llm.requests).toHaveLength(0);
+    expect(tools.calls).toHaveLength(0);
   });
 });

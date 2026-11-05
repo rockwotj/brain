@@ -10,7 +10,7 @@ import { join } from "node:path";
 import { FileStorage } from "../src/adapters/file-storage.ts";
 import { OpenAICompatibleEmbedder, OpenAICompatibleLlm } from "../src/adapters/openai-compatible.ts";
 import { UnsupportedContentError, type LlmRequest } from "../src/index.ts";
-import { SYSTEM1 } from "./fixtures/export-incident.ts";
+import { FAST } from "./fixtures/export-incident.ts";
 import { build, reply } from "./helpers.ts";
 
 type Sent = { url: string; body: Record<string, unknown>; headers: Record<string, string> };
@@ -21,7 +21,7 @@ function fakeFetch(response: unknown, sent: Sent[]): typeof fetch {
   }) as unknown as typeof fetch;
 }
 const request = (over: Partial<LlmRequest> = {}): LlmRequest => ({
-  agent: "a", profile: SYSTEM1, stablePrefixLength: 1,
+  agent: "a", profile: FAST, stablePrefixLength: 1,
   messages: [{ role: "system", content: "sys" }, { role: "user", content: "hi" }], ...over,
 });
 
@@ -29,10 +29,10 @@ describe("OpenAICompatibleLlm (mapping only, injected fetch)", () => {
   test("maps profile and messages to a chat request and reads usage", async () => {
     const sent: Sent[] = [];
     const llm = new OpenAICompatibleLlm({
-      baseUrl: "https://example.invalid/v1/", apiKey: "k", sendReasoningEffort: true, fastServiceTier: "priority",
+      baseUrl: "https://example.invalid/v1/", apiKey: "k", sendReasoningEffort: true, serviceTiers: { fast: "priority" },
       fetch: fakeFetch({ choices: [{ message: { content: "{\"proposals\":[]}" } }], usage: { prompt_tokens: 50, completion_tokens: 5, prompt_tokens_details: { cached_tokens: 40 } } }, sent),
     });
-    const profile = { ...SYSTEM1, reasoningEffort: "low" as const, serviceMode: "fast" as const, vision: true };
+    const profile = { ...FAST, reasoningEffort: "low" as const, serviceMode: "fast" as const, vision: true };
     const res = await llm.complete(request({
       profile,
       messages: [{ role: "system", content: "sys" }, { role: "user", content: [{ type: "text", text: "look" }, { type: "image", mimeType: "image/png", base64: "AAAA" }] }],
@@ -42,12 +42,12 @@ describe("OpenAICompatibleLlm (mapping only, injected fetch)", () => {
     expect(url).toBe("https://example.invalid/v1/chat/completions");
     expect(headers.authorization).toBe("Bearer k");
     expect(body).toEqual({
-      model: SYSTEM1.model,
+      model: FAST.model,
       messages: [
         { role: "system", content: "sys" },
         { role: "user", content: [{ type: "text", text: "look" }, { type: "image_url", image_url: { url: "data:image/png;base64,AAAA" } }] },
       ],
-      max_completion_tokens: SYSTEM1.maxOutputTokens,
+      max_completion_tokens: FAST.maxOutputTokens,
       response_format: { type: "json_object" },
       reasoning_effort: "low",
       service_tier: "priority",
@@ -59,7 +59,7 @@ describe("OpenAICompatibleLlm (mapping only, injected fetch)", () => {
     const llm = new OpenAICompatibleLlm({ baseUrl: "https://example.invalid", apiKey: "k", fetch: fakeFetch({}, sent) });
     const image = request({ messages: [{ role: "user", content: [{ type: "image", mimeType: "image/png", url: "https://x/y.png" }] }] });
     await expect(llm.complete(image)).rejects.toThrow(UnsupportedContentError);
-    const audio = request({ profile: { ...SYSTEM1, vision: true }, messages: [{ role: "user", content: [{ type: "audio", mimeType: "audio/wav", base64: "AA" }] }] });
+    const audio = request({ profile: { ...FAST, vision: true }, messages: [{ role: "user", content: [{ type: "audio", mimeType: "audio/wav", base64: "AA" }] }] });
     await expect(llm.complete(audio)).rejects.toThrow("must go through a LiveModel");
     expect(sent).toHaveLength(0);
   });
@@ -69,6 +69,17 @@ describe("OpenAICompatibleLlm (mapping only, injected fetch)", () => {
     expect(await ok.embed(["a", "b"])).toEqual([[1, 2], [3, 4]]);
     const bad = new OpenAICompatibleEmbedder({ baseUrl: "https://e.invalid", apiKey: "k", model: "emb", fetch: fakeFetch({ data: [{ embedding: [1] }] }, []) });
     await expect(bad.embed(["a", "b"])).rejects.toThrow("wrong number of rows");
+  });
+
+  test("service lanes map only to configured service_tier values (ultrafast included); nothing is guessed", async () => {
+    const ok = { choices: [{ message: { content: "{}" } }], usage: {} };
+    const sent: Sent[] = [];
+    const configured = new OpenAICompatibleLlm({ baseUrl: "https://x.invalid", apiKey: "k", serviceTiers: { ultrafast: "turbo" }, fetch: fakeFetch(ok, sent) });
+    await configured.complete(request({ profile: { ...FAST, serviceMode: "ultrafast" } }));
+    await configured.complete(request({ profile: { ...FAST, serviceMode: "fast" } })); // no "fast" value configured
+    const bare = new OpenAICompatibleLlm({ baseUrl: "https://x.invalid", apiKey: "k", fetch: fakeFetch(ok, sent) });
+    await bare.complete(request({ profile: { ...FAST, serviceMode: "ultrafast" } }));
+    expect(sent.map((s) => s.body.service_tier)).toEqual(["turbo", undefined, undefined]);
   });
 });
 

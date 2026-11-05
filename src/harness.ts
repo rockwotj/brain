@@ -4,6 +4,7 @@
  * `run()` for a one-shot task in a fresh session.
  */
 import type { SpecialistSpec } from "./agents.ts";
+import type { DecisionModel } from "./io/decision.ts";
 import type { Embedder } from "./io/embeddings.ts";
 import { roughTokenEstimate, type LlmClient, type Profiles, type TokenEstimator } from "./io/llm.ts";
 import type { LiveModel } from "./io/live.ts";
@@ -39,6 +40,13 @@ export type RecallSettings = { knowledge: number; episodes: number; minSimilarit
 /** minSimilarity depends on the embedding model; tune it for yours. */
 const DEFAULT_RECALL: RecallSettings = { knowledge: 2, episodes: 1, minSimilarity: 0.3 };
 
+/**
+ * Optional decision model for soft routing. `wakeThreshold`: minimum probability
+ * to wake a specialist; `escalateThreshold`: minimum probability to consult the
+ * executive when no hard reason (surprise, conflict, stall, media, follow-up) applies.
+ */
+export type DecisionSettings = { model: DecisionModel; wakeThreshold: number; escalateThreshold: number };
+
 export type HarnessConfig = {
   llm: LlmClient;
   profiles: Profiles;
@@ -53,6 +61,8 @@ export type HarnessConfig = {
   embedder?: Embedder;
   /** Required for audio/video input; without it such input is rejected. */
   live?: LiveModel;
+  /** Without it, routing and escalation use the built-in deterministic rules. */
+  decisions?: Pick<DecisionSettings, "model"> & Partial<DecisionSettings>;
   workspace?: WorkspaceBudget;
   evidence?: Partial<EvidenceSettings>;
   recall?: Partial<RecallSettings>;
@@ -71,6 +81,7 @@ export class Harness {
   readonly evidence: EvidenceSettings;
   readonly recall: RecallSettings;
   readonly estimate: TokenEstimator;
+  readonly decisions: DecisionSettings | undefined;
 
   constructor(readonly config: HarnessConfig) {
     this.storage = config.storage ?? new MemoryStorage();
@@ -82,6 +93,7 @@ export class Harness {
     this.evidence = { ...DEFAULT_EVIDENCE, ...config.evidence };
     this.recall = { ...DEFAULT_RECALL, ...config.recall };
     this.estimate = config.estimate ?? roughTokenEstimate;
+    this.decisions = config.decisions ? { wakeThreshold: 0.5, escalateThreshold: 0.5, ...config.decisions } : undefined;
   }
 
   /** Open (or reopen from storage) a session. Agents' transcripts persist across its turns. */

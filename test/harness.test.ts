@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
-import { FunctionTools, type LlmRequest } from "../src/index.ts";
-import { GOAL, makeScenario, READ_ONLY } from "./fixtures/export-incident.ts";
+import { FunctionTools, withUrgency, type LlmRequest } from "../src/index.ts";
+import { FAST, GOAL, makeScenario, READ_ONLY } from "./fixtures/export-incident.ts";
 import { approveHabit, build, isPrefix, narration, reply } from "./helpers.ts";
 
 describe("end-to-end scenario (scripted models)", () => {
@@ -13,10 +13,10 @@ describe("end-to-end scenario (scripted models)", () => {
     expect(result.answer.citations).toEqual(["act-1", "act-2", "act-3"]);
 
     const tiers = result.modelCalls.map((c) => c.tier);
-    const firstSystem2 = tiers.indexOf("system2");
-    expect(firstSystem2).toBeGreaterThan(0);
-    expect(tiers.slice(0, firstSystem2).every((t) => t === "system1")).toBe(true);
-    expect(tiers.filter((t) => t === "system2")).toHaveLength(1);
+    const firstReasoning = tiers.indexOf("reasoning");
+    expect(firstReasoning).toBeGreaterThan(0);
+    expect(tiers.slice(0, firstReasoning).every((t) => t === "fast")).toBe(true);
+    expect(tiers.filter((t) => t === "reasoning")).toHaveLength(1);
     const executiveCall = result.modelCalls.find((c) => c.agent === "executive")!;
     const surprise = result.actions.find((a) => a.surprise)!;
     expect(executiveCall.step).toBe(surprise.step + 1);
@@ -53,8 +53,15 @@ describe("end-to-end scenario (scripted models)", () => {
     await harness.run({ input: GOAL, constraints: [{ ...READ_ONLY }], urgency: "high" });
     const triage = llm.requests.find((r) => r.agent === "triage")!;
     expect(triage.profile.serviceMode).toBe("fast");
-    expect(triage.profile.tier).toBe("system1");
+    expect(triage.profile.tier).toBe("fast");
     expect(llm.requests.find((r) => r.agent === "executive")!.profile.reasoningEffort).toBe("high");
+  });
+
+  test("urgency never downgrades an explicitly faster lane", () => {
+    expect(withUrgency({ ...FAST, serviceMode: "ultrafast" }, "high").serviceMode).toBe("ultrafast");
+    expect(withUrgency({ ...FAST, serviceMode: "fast" }, "high").serviceMode).toBe("fast");
+    expect(withUrgency(FAST, "high")).toMatchObject({ serviceMode: "fast", model: FAST.model, tier: "fast", reasoningEffort: "none" });
+    expect(withUrgency({ ...FAST, serviceMode: "ultrafast" }, "normal").serviceMode).toBe("ultrafast");
   });
 });
 

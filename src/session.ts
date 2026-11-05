@@ -3,14 +3,18 @@
  * whose transcripts carry across turns (new turns arrive as deltas).
  *
  * One turn = perceive, then bounded steps of:
- *   habits (reflex) -> woken specialists in parallel (System 1)
- *   -> escalate to the executive (System 2) only if the monitor asks
+ *   habits (reflex) -> route: wake specialists (fast models) in parallel
+ *   -> escalate to the executive (reasoning model) on a hard reason or a judgment
  *   -> select at most one candidate -> act (via the actuator) and route the outcome, or finish.
+ * Routing and the escalation judgment use the optional DecisionModel (typed
+ * probabilities, no generated text) and fall back to deterministic rules.
  * Bounded by max steps, a model-call budget, stall detection and an AbortSignal.
  */
 import { makeAgent, type Agent, type SpecialistSpec } from "./agents.ts";
-import { describeMedia, isMedia, textOf, toParts, type ContentPart, type MediaPart } from "./io/content.ts";
+import { describeMedia, isMedia, textOf, toParts, type ContentPart } from "./io/content.ts";
+import { checkDecisions, type DecisionAnswer, type DecisionQuestion } from "./io/decision.ts";
 import { embedOne } from "./io/embeddings.ts";
+import { clipInput, takeObservations, type LiveInput } from "./io/live.ts";
 import { chooseProfile, UnsupportedContentError, type LlmClient, type ModelProfile } from "./io/llm.ts";
 import type { Harness } from "./harness.ts";
 import { Monitor } from "./monitor.ts";
@@ -20,8 +24,10 @@ import { callText, clip, describeEvent, outcomeSummary, perceptionSummary, visib
 import type { ActionRecord, Completion, Constraint, Effect, Episode, HarnessEvent, PerceptionRecord, Proposal, RecordReadProposal, RunStatus } from "./types.ts";
 
 export type TurnOptions = {
-  /** What the user said: text, or content parts (text, image, audio, video). */
+  /** What the user said: text, or content parts (text, image, recorded audio/video clips). */
   input: string | readonly ContentPart[];
+  /** Live audio/video sources (async chunk streams), read during perception. */
+  live?: readonly LiveInput[];
   constraints?: Constraint[];
   urgency?: "normal" | "high";
   /** Ideas prepared while idle; admitted at low priority. */
@@ -34,6 +40,8 @@ export type TurnOptions = {
 };
 
 export type ModelCall = { step: number; agent: string; profile: string; tier: ModelProfile["tier"] };
+/** One decision-model request: valid typed answers plus any issues (which fall back to the deterministic rule). */
+export type DecisionCall = { step: number; purpose: "route" | "escalate"; answers: Record<string, DecisionAnswer>; issues: string[] };
 
 export type RunResult = {
   status: RunStatus;
@@ -48,6 +56,7 @@ export type RunResult = {
   events: HarnessEvent[];
   trace: string[];
   modelCalls: ModelCall[];
+  decisions: DecisionCall[];
   usage: { inputTokens: number; cachedInputTokens: number; outputTokens: number };
   state: StateStore;
 };
@@ -56,8 +65,19 @@ export type RunResult = {
 const WAKING = new Set(["goal.set", "constraint.add", "constraint.remove", "workspace.admit", "action.outcome", "action.blocked", "perception"]);
 
 const EXECUTIVE_INSTRUCTIONS =
-  "You are consulted only on novelty, conflict, surprise, stalls, images only you can see, or a record you asked for. Diagnose why, add 'focus' " +
+  "You are consulted only on novelty, conflict, surprise, stalls, images only you can see, a record you asked for, or when the router judges the situation needs you. Diagnose why, add 'focus' " +
   "observations to steer the specialists, and propose at most one next action or a finish backed by evidence.";
+
+const ESCALATE_QUESTION: DecisionQuestion = {
+  type: "boolean",
+  instructions: "Should the slower reasoning executive think about this situation before anything else happens?",
+  criteria: {
+    true: "the goal is new or unclear, the proposals are missing, contradict each other, or do not fit the evidence",
+    false: "a proposal is a sensible next step, or the goal is already answered",
+  },
+};
+
+type SpecialistSlot = { spec: SpecialistSpec; agent: Agent; seen: number };
 
 /** Per-turn bookkeeping. */
 type Turn = {
@@ -68,6 +88,7 @@ type Turn = {
   events: HarnessEvent[];
   trace: string[];
   modelCalls: ModelCall[];
+  decisions: DecisionCall[];
   usage: RunResult["usage"];
   monitor: Monitor;
   reportedBlocks: Set<string>;
@@ -84,7 +105,7 @@ type Turn = {
 
 function newTurn(stallSteps: number, signal?: AbortSignal): Turn {
   return {
-    step: 0, status: "max_steps", records: [], events: [], trace: [], modelCalls: [],
+    step: 0, status: "max_steps", records: [], events: [], trace: [], modelCalls: [], decisions: [],
     usage: { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0 }, monitor: new Monitor(stallSteps),
     reportedBlocks: new Set(), readsSinceWrite: new Set(), writesThisTurn: new Set(), delivered: false, mediaUnseen: false,
     ...(signal ? { signal } : {}),
@@ -92,7 +113,7 @@ function newTurn(stallSteps: number, signal?: AbortSignal): Turn {
 }
 
 export class Session {
-  private readonly specialists: { spec: SpecialistSpec; agent: Agent; seen: number }[];
+  private readonly specialists: SpecialistSlot[];
   private readonly executive: Agent;
   private readonly narrator: Agent;
   /** Every model call goes through this meter (specialists, executive, narrator). */
@@ -166,17 +187,19 @@ export class Session {
     const parts = toParts(opts.input);
     const media = parts.filter(isMedia);
     const images = media.filter((m) => m.type === "image");
-    const streams = media.filter((m) => m.type !== "image");
     for (const m of media) if (!m.base64 && !m.url) throw new UnsupportedContentError(`${describeMedia(m)} needs base64 data or a url`);
+    // Recorded clips become one-chunk streams; live sources are passed through as they are.
+    const streams = [...media.filter((m) => m.type !== "image").map(clipInput), ...(opts.live ?? [])];
     const { profiles, live } = this.h.config;
-    if (images.length && !profiles.system1.vision && !profiles.system2.vision) {
+    const specialistVision = !!chooseProfile(profiles, "specialist").vision;
+    if (images.length && !specialistVision && !chooseProfile(profiles, "executive").vision) {
       throw new UnsupportedContentError("image input needs a model profile with vision: true");
     }
-    const executiveOnlyVision = images.length > 0 && !profiles.system1.vision;
+    const executiveOnlyVision = images.length > 0 && !specialistVision;
     if (executiveOnlyVision && this.h.limits.maxExecutiveCalls < 1) {
       throw new UnsupportedContentError("image input can only be seen by the executive, but limits.maxExecutiveCalls is 0");
     }
-    if (streams[0] && !live) throw new UnsupportedContentError(`${describeMedia(streams[0])} input needs a LiveModel; none is configured`);
+    if (streams[0] && !live) throw new UnsupportedContentError(`${streams[0].medium} (${streams[0].mimeType}) input needs a LiveModel; none is configured`);
 
     if (opts.newTask) await this.startNewTask();
     const goal = textOf(parts).trim() || "(no text: see the attached media and observations)";
@@ -197,20 +220,18 @@ export class Session {
   }
 
   /**
-   * Audio/video go to the LiveModel. Its observations (bounded) are collected into one
-   * perception record per input; the workspace gets a single pointer to it.
+   * Audio/video streams go to the LiveModel before any step runs (a bounded perception
+   * phase, not concurrent cognition). Each stream is read until it ends or yields
+   * `maxLiveObservations` observations; they become one perception record, and the
+   * workspace gets a single pointer to it.
    */
-  private async listen(streams: readonly MediaPart[], focus: string): Promise<void> {
+  private async listen(streams: readonly LiveInput[], focus: string): Promise<void> {
     const live = this.h.config.live;
     if (!live) return;
-    for (const media of streams) {
-      const observations: string[] = [];
-      for await (const observation of live.observe(media, focus, this.t.signal)) {
-        observations.push(observation);
-        if (observations.length >= this.h.limits.maxLiveObservations) break;
-      }
+    for (const input of streams) {
+      const observations = await takeObservations(live.observe(input.chunks, focus, this.t.signal), this.h.limits.maxLiveObservations, this.t.signal);
       const record: PerceptionRecord = {
-        id: this.state.nextPerceptionId(), source: `live:${live.name}`, medium: media.type === "video" ? "video" : "audio", mimeType: media.mimeType, observations,
+        id: this.state.nextPerceptionId(), source: `live:${live.name}`, medium: input.medium, mimeType: input.mimeType, observations,
       };
       await this.state.apply(record.source, { type: "perception", record });
       const preview = perceptionSummary(record, Math.max(40, this.state.budget.maxItemChars - 120));
@@ -258,9 +279,9 @@ export class Session {
     } else {
       const pool = [...habits];
       if (!(await this.consultSpecialists(pool))) return "budget_exhausted";
-      if (t.step === 1 && pool.length === 0 && !t.delivered) t.monitor.flag("novelty");
       let result = this.arbitrate(pool);
       if (result.selection.kind === "hold") t.monitor.flag("conflict");
+      await this.judgeEscalation(pool, result, startSeq);
       const escalated = await this.escalate(pool, result);
       if (escalated === "budget_exhausted") return escalated;
       result = escalated;
@@ -309,16 +330,21 @@ export class Session {
     return decision.allowed && decision.spec.effect === "read" ? only : undefined;
   }
 
-  /** System 1: wake only specialists with visible news from someone else (or private notes); run them in parallel. */
+  /**
+   * Wake specialists that have visible news from someone else (or private notes) and
+   * run them in parallel on the fast profile. A decision model, if configured, can
+   * skip some of them (soft routing); private notes always wake their owner.
+   */
   private async consultSpecialists(pool: Candidate[]): Promise<boolean> {
     const t = this.t;
-    const woken = this.specialists.filter((s) =>
+    const due = this.specialists.filter((s) =>
       s.agent.inbox.length > 0 ||
       this.state.eventsSince(s.seen).some((e) => e.source !== s.spec.name && visibleTo(e, s.spec.name) && (s.spec.wakeOn ?? ((ev) => WAKING.has(ev.delta.type)))(e)));
+    const woken = await this.route(due);
     // Keep one call in reserve for the executive while it still has images to examine.
     if (!this.budgetFor(woken.length + (t.mediaUnseen ? 1 : 0))) return false;
-    if (woken.length) t.trace.push(`  wake [${woken.map((s) => s.spec.name).join(", ")}] in parallel on ${this.h.config.profiles.system1.id}`);
-    for (const s of woken) s.seen = this.state.seq;
+    if (woken.length) t.trace.push(`  wake [${woken.map((s) => s.spec.name).join(", ")}] in parallel on ${chooseProfile(this.h.config.profiles, "specialist").id}`);
+    for (const s of due) s.seen = this.state.seq; // skipped specialists still get these events as deltas later
     const replies = await Promise.all(woken.map(async (s) => (await this.consult(s.agent, `Step ${t.step}: propose only what is new and useful; otherwise reply with no proposals.`)).proposals));
     t.signal?.throwIfAborted();
     for (const [i, proposals] of replies.entries()) {
@@ -328,14 +354,57 @@ export class Session {
     return true;
   }
 
-  /** System 2, on demand: the monitor decides whether the expensive executive is worth it. */
+  /** Ask the decision model which due specialists should wake. Missing or invalid answers wake (fallback). */
+  private async route(due: SpecialistSlot[]): Promise<SpecialistSlot[]> {
+    const d = this.h.decisions;
+    const ask = due.filter((s) => s.agent.inbox.length === 0);
+    if (!d || !ask.length) return due;
+    const questions: Record<string, DecisionQuestion> = {};
+    for (const s of ask) {
+      questions[s.spec.name] = {
+        type: "boolean",
+        instructions: `Should the specialist "${s.spec.name}" look at the situation now? Its job: ${s.spec.instructions}`,
+        criteria: { true: "the new events concern its job and it could add a useful proposal", false: "nothing new concerns its job" },
+      };
+    }
+    const answers = await this.decide("route", this.decisionState(Math.min(...ask.map((s) => s.seen))), questions);
+    const wakes = (s: SpecialistSlot) => {
+      const a = answers[s.spec.name];
+      return s.agent.inbox.length > 0 || a?.type !== "boolean" || a.probability >= d.wakeThreshold;
+    };
+    this.t.trace.push(`  route: ${ask.map((s) => `${s.spec.name} ${probabilityText(answers[s.spec.name])} ${wakes(s) ? "wake" : "skip"}`).join(", ")}`);
+    return due.filter(wakes);
+  }
+
+  /**
+   * Without a hard reason to escalate, decide whether the executive is needed anyway.
+   * Decision model: escalate when P(yes) >= escalateThreshold. Fallback (no model,
+   * invalid answer, or no executive budget): "novelty" when step 1 produced nothing.
+   */
+  private async judgeEscalation(pool: Candidate[], result: SelectResult, sinceSeq: number): Promise<void> {
+    const t = this.t;
+    if (t.monitor.hasPending() || this.executive.inbox.length) return; // a hard reason already escalates
+    const novel = t.step === 1 && pool.length === 0 && !t.delivered;
+    const d = this.h.decisions;
+    let answer: DecisionAnswer | undefined;
+    if (d && this.executiveAvailable()) {
+      const proposals = pool.map((c) => `- ${c.origin}: ${c.key}${c.proposal.kind === "action" ? ` (${c.proposal.rationale})` : ""}`);
+      const extra = `PROPOSALS THIS STEP\n${proposals.join("\n") || "- (none)"}\nSELECTOR: ${result.selection.kind}: ${result.selection.why}`;
+      answer = (await this.decide("escalate", this.decisionState(sinceSeq, extra), { escalate: ESCALATE_QUESTION })).escalate;
+    }
+    if (d && answer?.type === "boolean") {
+      t.trace.push(`  judge escalation: ${probabilityText(answer)}`);
+      if (answer.probability >= d.escalateThreshold) t.monitor.flag("judged");
+    } else if (novel) t.monitor.flag("novelty");
+  }
+
+  /** The reasoning executive, on demand: only when the monitor has a reason. */
   private async escalate(pool: Candidate[], result: SelectResult): Promise<SelectResult | "budget_exhausted"> {
     const t = this.t;
     const reasons = t.monitor.takeReasons();
     if (this.executive.inbox.length) reasons.push("follow_up");
     if (!reasons.length) return result;
-    const used = t.modelCalls.filter((c) => c.agent === "executive").length;
-    if (used >= this.h.limits.maxExecutiveCalls || !this.budgetFor(1)) {
+    if (!this.executiveAvailable()) {
       t.trace.push(`  escalation (${reasons.join(", ")}) skipped: executive or model-call budget used`);
       if (t.mediaUnseen) {
         t.trace.push("  stop: images only the executive can see were never examined; no blind action released");
@@ -343,13 +412,42 @@ export class Session {
       }
       return result;
     }
-    t.trace.push(`  escalate (${reasons.join(", ")}) -> executive on ${this.h.config.profiles.system2.id}`);
+    t.trace.push(`  escalate (${reasons.join(", ")}) -> executive on ${this.executive.profile.id}`);
     t.monitor.executiveConsulted();
     const reply = await this.consult(this.executive, `ESCALATION: ${reasons.join(", ")}. Diagnose, steer with focus items, and propose the next action or a finish.`);
     t.signal?.throwIfAborted();
     if (!reply.failed) t.mediaUnseen = false;
     await this.absorb(this.executive, reply.proposals, "executive", pool);
     return this.arbitrate(pool);
+  }
+
+  private executiveAvailable(): boolean {
+    const used = this.t.modelCalls.filter((c) => c.agent === "executive").length;
+    return used < this.h.limits.maxExecutiveCalls && this.budgetFor(1);
+  }
+
+  // --- decisions (soft routing only; never policy) ---
+
+  private async decide(purpose: DecisionCall["purpose"], state: string, questions: Record<string, DecisionQuestion>): Promise<Record<string, DecisionAnswer>> {
+    const t = this.t;
+    const model = this.h.decisions!.model;
+    let checked: { answers: Record<string, DecisionAnswer>; issues: string[] };
+    try {
+      const raw = await model.decide({ purpose, state, questions, ...(t.signal ? { signal: t.signal } : {}) });
+      checked = checkDecisions(questions, raw);
+    } catch (error) {
+      if (t.signal?.aborted) throw error;
+      checked = { answers: {}, issues: [`${model.name} failed: ${error instanceof Error ? error.message : String(error)}`] };
+    }
+    t.decisions.push({ step: t.step, purpose, ...checked });
+    for (const issue of checked.issues) t.trace.push(`  ! decision ${purpose}: ${issue} (deterministic fallback)`);
+    return checked.answers;
+  }
+
+  /** What the decision model judges: the snapshot plus recent events (and optional extra lines). */
+  private decisionState(sinceSeq: number, extra?: string): string {
+    const events = this.state.eventsSince(sinceSeq).slice(-20).map((e) => describeEvent(e, this.state.previewChars));
+    return [this.state.renderSnapshot(), events.length ? `NEW EVENTS\n${events.join("\n")}` : "", extra ?? ""].filter(Boolean).join("\n\n");
   }
 
   private arbitrate(pool: Candidate[]): SelectResult {
@@ -492,7 +590,7 @@ export class Session {
     t.trace.push(`end: ${t.status}${t.completion ? ` (${t.completion})` : ""} after ${t.step} steps; episode ${episode.id}`);
     return {
       status: t.status, steps: t.step, ...(t.completion ? { completion: t.completion } : {}), answer, episode,
-      actions: t.records, events: t.events, trace: t.trace, modelCalls: t.modelCalls, usage: t.usage, state: this.state,
+      actions: t.records, events: t.events, trace: t.trace, modelCalls: t.modelCalls, decisions: t.decisions, usage: t.usage, state: this.state,
     };
   }
 
@@ -506,4 +604,8 @@ export class Session {
     this.narrator.transcript.reset(); // the narrator is stateless per turn: fresh snapshot + trace
     return narrate(this.llm, this.narrator, this.state, t.records, this.h.evidence.narratorRecordChars, t.signal);
   }
+}
+
+function probabilityText(answer: DecisionAnswer | undefined): string {
+  return answer?.type === "boolean" ? `p=${answer.probability.toFixed(2)}` : "p=?";
 }

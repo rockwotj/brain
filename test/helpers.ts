@@ -1,5 +1,5 @@
 import { FunctionTools, Harness, type HarnessConfig, type LlmRequest, type Message, type SpecialistSpec, type ToolCall } from "../src/index.ts";
-import { SYSTEM1, SYSTEM2, TOOLS } from "./fixtures/export-incident.ts";
+import { FAST, REASONING, TOOLS } from "./fixtures/export-incident.ts";
 import { ScriptedLlm, sameMessage } from "./fixtures/scripted-llm.ts";
 
 export const reply = (...proposals: unknown[]) => JSON.stringify({ proposals });
@@ -22,7 +22,7 @@ export function build(
   const tools = quietTools();
   const harness = new Harness({
     llm,
-    profiles: { system1: SYSTEM1, system2: SYSTEM2 },
+    profiles: { fast: FAST, reasoning: REASONING },
     tools: TOOLS,
     toolPort: tools,
     specialists: [{ name: "triage", instructions: "investigate", tools: ["read_job_logs", "check_quota", "restart_job"], canFinish: true }],

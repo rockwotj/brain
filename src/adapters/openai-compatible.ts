@@ -12,8 +12,12 @@ export type OpenAICompatibleOptions = {
   apiKey: string;
   /** Send the profile's `reasoningEffort` as `reasoning_effort` (only for models that support it). */
   sendReasoningEffort?: boolean;
-  /** `service_tier` value to send when a profile asks for the "fast" lane, if the provider has one. */
-  fastServiceTier?: string;
+  /**
+   * `service_tier` value to send per service lane, only for lanes your provider
+   * actually offers. A lane without a configured value sends no `service_tier`
+   * (the provider's default lane); nothing is guessed.
+   */
+  serviceTiers?: { fast?: string; ultrafast?: string };
   /** Name of the output-limit field; older servers only know `max_tokens`. */
   tokenLimitField?: "max_completion_tokens" | "max_tokens";
   /** Ask for `response_format: json_object` (all harness prompts request JSON). Default true. */
@@ -36,7 +40,9 @@ export class OpenAICompatibleLlm implements LlmClient {
     };
     if (this.opts.jsonMode ?? true) body.response_format = { type: "json_object" };
     if (this.opts.sendReasoningEffort && req.profile.reasoningEffort !== "none") body.reasoning_effort = req.profile.reasoningEffort;
-    if (this.opts.fastServiceTier && req.profile.serviceMode === "fast") body.service_tier = this.opts.fastServiceTier;
+    const mode = req.profile.serviceMode;
+    const tier = mode === "standard" ? undefined : this.opts.serviceTiers?.[mode];
+    if (tier) body.service_tier = tier;
 
     const data = await post(this.opts, "/chat/completions", body, req.signal);
     const content = data?.choices?.[0]?.message?.content;

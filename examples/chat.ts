@@ -3,18 +3,22 @@
  * Real provider calls only; nothing here is scripted. (Not run in CI.)
  *
  *   OPENAI_BASE_URL=https://api.openai.com/v1 OPENAI_API_KEY=... \
- *   SYSTEM1_MODEL=<small fast model> SYSTEM2_MODEL=<reasoning model> bun run chat
+ *   FAST_MODEL=<small fast model> REASONING_MODEL=<reasoning model> bun run chat
  *
  * Optional env:
- *   EMBEDDING_MODEL=...      enables memory recall (cosine similarity)
- *   VISION=system2|all       which profiles accept images (default: none)
- *   SYSTEM2_REASONING=1      send reasoning_effort for the System 2 model
- *   CONTEXT_WINDOW=128000    context window of both models (tokens)
- *   BRAIN_DATA=.brain-data   directory for sessions, records and memory
+ *   EMBEDDING_MODEL=...           enables memory recall (cosine similarity)
+ *   VISION=reasoning|all          which profiles accept images (default: none)
+ *   SEND_REASONING_EFFORT=1       send reasoning_effort (only for models that accept it)
+ *   FAST_SERVICE_MODE=standard|fast|ultrafast   service lane for the fast profile (default standard)
+ *   SERVICE_TIER_FAST=...         provider `service_tier` value for the "fast" lane, if it has one
+ *   SERVICE_TIER_ULTRAFAST=...    provider `service_tier` value for the "ultrafast" lane, if it has one
+ *   CONTEXT_WINDOW=128000         context window of both models (tokens)
+ *   BRAIN_DATA=.brain-data        directory for sessions, records and memory
  *
  * Commands: /image <path> (attach to the next message), /new (task boundary),
  * /sleep (consolidate episodes into knowledge), /quit.
- * Audio/video: no LiveModel adapter ships with this PoC, so they are not accepted here.
+ * Audio/video and decision models: no adapters ship with this PoC, so this
+ * example runs without them (deterministic routing; no audio/video input).
  */
 import { readdir, readFile } from "node:fs/promises";
 import { extname, relative, resolve } from "node:path";
@@ -32,13 +36,15 @@ function env(name: string): string {
 const connection = { baseUrl: env("OPENAI_BASE_URL"), apiKey: env("OPENAI_API_KEY") };
 const contextWindow = Number(process.env.CONTEXT_WINDOW ?? 128_000);
 const vision = process.env.VISION ?? "";
-const system1: ModelProfile = {
-  id: "system1", model: env("SYSTEM1_MODEL"), tier: "system1", reasoningEffort: "none", serviceMode: "standard",
+const fastMode = process.env.FAST_SERVICE_MODE ?? "standard";
+if (fastMode !== "standard" && fastMode !== "fast" && fastMode !== "ultrafast") throw new Error("FAST_SERVICE_MODE must be standard, fast or ultrafast");
+const fast: ModelProfile = {
+  id: "fast", model: env("FAST_MODEL"), tier: "fast", reasoningEffort: "none", serviceMode: fastMode,
   contextWindow, maxOutputTokens: 1_000, vision: vision === "all",
 };
-const system2: ModelProfile = {
-  id: "system2", model: env("SYSTEM2_MODEL"), tier: "system2", reasoningEffort: "medium", serviceMode: "standard",
-  contextWindow, maxOutputTokens: 4_000, vision: vision === "all" || vision === "system2",
+const reasoning: ModelProfile = {
+  id: "reasoning", model: env("REASONING_MODEL"), tier: "reasoning", reasoningEffort: "medium", serviceMode: "standard",
+  contextWindow, maxOutputTokens: 4_000, vision: vision === "all" || vision === "reasoning",
 };
 
 // Real, read-only tools scoped to the current directory.
@@ -59,11 +65,15 @@ const toolPort = new FunctionTools({
   read_file: async (args) => readFile(inside(String(args.path)), "utf8"),
 });
 
-const llm = new OpenAICompatibleLlm({ ...connection, sendReasoningEffort: process.env.SYSTEM2_REASONING === "1" });
+const serviceTiers = {
+  ...(process.env.SERVICE_TIER_FAST ? { fast: process.env.SERVICE_TIER_FAST } : {}),
+  ...(process.env.SERVICE_TIER_ULTRAFAST ? { ultrafast: process.env.SERVICE_TIER_ULTRAFAST } : {}),
+};
+const llm = new OpenAICompatibleLlm({ ...connection, sendReasoningEffort: process.env.SEND_REASONING_EFFORT === "1", serviceTiers });
 const embeddingModel = process.env.EMBEDDING_MODEL;
 const harness = new Harness({
   llm,
-  profiles: { system1, system2 },
+  profiles: { fast, reasoning },
   tools,
   toolPort,
   permissions: { allowEffects: ["read"] },
@@ -90,7 +100,7 @@ while (true) {
     continue;
   }
   if (line === "/sleep") {
-    const report = await consolidate({ llm, profile: system2, episodes: harness.episodes, knowledge: harness.knowledge, habits: harness.habits, tools });
+    const report = await consolidate({ llm, profile: reasoning, episodes: harness.episodes, knowledge: harness.knowledge, habits: harness.habits, tools });
     console.log(`replayed ${report.replayed.length} episodes, learned ${report.learned.length}, habits proposed ${report.habitsProposed.length} (pending approval)`);
     continue;
   }
@@ -108,7 +118,7 @@ while (true) {
     console.log(`brain> ${result.answer.text}`);
     const tiers = result.modelCalls.map((c) => c.tier);
     console.log(`  (${result.status}${result.completion ? `, ${result.completion}` : ""}; ${result.steps} steps; ` +
-      `calls system1=${tiers.filter((t) => t === "system1").length} system2=${tiers.filter((t) => t === "system2").length}; ` +
+      `calls fast=${tiers.filter((t) => t === "fast").length} reasoning=${tiers.filter((t) => t === "reasoning").length}; ` +
       `input tokens ${result.usage.inputTokens}, provider-reported cached ${result.usage.cachedInputTokens})`);
   } catch (error) {
     console.log(`error: ${error instanceof Error ? error.message : String(error)}`);
