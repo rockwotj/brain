@@ -1,346 +1,315 @@
 # brain
 
-A small, readable TypeScript proof of concept for an LLM agent harness built
-from brain-inspired parts. Several narrow specialists on a fast model propose
-what to do next. A reasoning model (the executive) is consulted only when
-needed. An optional decision model makes quick routing calls with typed
-probabilities. A single policy-checked actuator runs every tool call.
+A small, readable TypeScript proof of concept for an LLM agent harness where
+several models work at different speeds: cheap, narrow **specialists** run in
+parallel on a fast model; a slower **executive** on a reasoning model is
+consulted only when something calls for thought; and a deterministic
+**runtime** decides what actually happens.
 
-This is a proof of concept, not a framework. The brain vocabulary is a loose
-engineering metaphor.
+It is a place to try out ideas in plain code, not a product. There are no
+benchmarks, and the test suite never calls a live model provider.
 
-## What it does, and why
+## Why it exists
 
-You give the harness a goal: text, images, recorded audio or video clips, or a
-live audio/video stream. It works on the goal in bounded steps until it can
-answer, or until a step, budget or stall limit stops it.
+Many agent loops send every step to one large model with one ever-growing
+prompt. This project tries a different split:
 
-The design aims for:
+- **Cheap by default, expensive on demand.** Specialists use the fast profile.
+  The reasoning model is woken for a reason: a tool result that contradicts a
+  prediction, conflicting proposals, a stall, a new goal nobody could act on,
+  images only it can see, or a judgment that it is needed.
+- **Models propose, the runtime decides.** Agents only reply with JSON
+  proposals. A deterministic selector releases at most one action per step, and
+  every tool call passes a policy gate. No model can get around a read-only
+  constraint.
+- **Judging is not generating.** "Should this specialist look?" and "does the
+  executive need to think?" are typed questions (yes/no, choice, score) answered
+  with probabilities by a separate *decision model* port: a fast classifier,
+  sometimes called a "System One" model, that never writes text. It only
+  steers routing; hard rules never depend on it.
+- **Prompts that stay cacheable.** Each agent keeps its own append-only
+  transcript. New information arrives as deltas, so each of an agent's requests
+  extends its previous one exactly and a provider can reuse the cached prefix. The
+  transcript is compacted into a fresh snapshot near the context limit or when
+  an optional provider-supplied cache-expiry hint calls for it.
+- **No provider lock-in.** The core talks to small ports (LLM, decision model,
+  embeddings, live audio/video, storage, tools). One OpenAI-compatible HTTP
+  adapter and a file-storage adapter ship with it; the rest is yours to plug in.
 
-- **Low cost.** Most model calls go to a small fast model. The reasoning model
-  runs only on surprises, conflicts, stalls, media only it can see, or when a
-  judgment says it is needed. Approved read-only habits run with no model call.
-- **Prompt-cache-friendly prompts.** Every agent keeps one append-only
-  transcript. All agents share a byte-identical leading system block. New
-  information is appended as deltas, and the transcript is rebuilt
-  (compacted) only just before it would overflow, or when the provider says
-  its cache has expired.
-- **Safety by construction.** Models only *propose*. Hard policy (read-only
-  mode, denied tools, allowed effects, argument validation) is checked in code
-  by the selector and checked again by the actuator, the only component that
-  runs tools. Probabilities from the decision model never affect policy.
-- **Evidence you can check.** Every tool output is stored in full as a record
-  (`act-N`). Agents see short previews and can read any record in full. A
-  "verified" answer must cite a successful record.
-- **No vendor lock-in.** LLMs, decision models, embeddings, live media models,
-  storage and tools all sit behind small interfaces. The core imports no SDK.
+Names like *workspace*, *executive*, *habit* and *sleep* are borrowed from
+cognitive science as design metaphors. This is not a model of the brain.
 
-## Generation versus decisions
+## What a run does
 
-The harness uses two different kinds of model for two different jobs.
+A **session** is one conversation. Each `session.turn()` (or `harness.run()`,
+a single turn in a fresh session) goes like this:
 
-- **Generative LLMs** (`LlmClient`) write text: specialists' proposals, the
-  executive's diagnosis and plan, the narrator's answer. Each agent's model is
-  set by its profile: `fast` for specialists and the narrator, `reasoning`
-  for the executive.
-- **A decision model** (`DecisionModel`, optional) writes no text. It reads a
-  state and answers predefined questions with typed results: a yes/no
-  probability, one of a set of options, or a score on a scale. This is the
-  kind of model TypeSafe calls a *System One* model. The harness asks it two
-  things:
-  1. **Routing:** for each specialist with something new to look at, *should
-     it wake now?* (`P(yes) >= wakeThreshold` wakes it.)
-  2. **Escalation:** when there is no hard reason to escalate, *should the
-     executive think about this first?* (`P(yes) >= escalateThreshold`
-     consults it.)
+1. **Perceive.** The input text (plus any images) becomes the goal, and
+   constraints are pinned. Audio and video streams, if any, are read by your
+   `LiveModel` into one perception record. This happens before the first step
+   and stops after `maxLiveObservations`. With an embedder, related knowledge
+   and past episodes are recalled into the workspace, marked as unverified
+   claims.
+2. **Step**, up to `maxSteps` times:
+   - **Reflex.** If exactly one approved, read-only habit matches the goal and
+     nothing needs attention, it runs with no model call.
+   - **Route.** Otherwise, specialists that have news visible to them are woken
+     and called in parallel. If you configure a decision model, it can skip
+     some of them. Each replies with zero or more proposals: an observation, a
+     tool action with a predicted outcome, a request to read a full record, or
+     a finish.
+   - **Escalate.** If the monitor has a reason, or the decision model judges it
+     needed, the executive is called and its proposals join the pool.
+   - **Select.** Proposals blocked by policy are dropped and broadcast. The
+     rest are ranked by origin (executive > habit > specialist), then kind
+     (verified finish > read > write > answer-only finish), then how many
+     distinct model profiles agree. If the top two tie and one of them writes,
+     nothing runs and the executive is consulted.
+   - **Act.** The actuator checks policy again and calls your `ToolPort`. If
+     the outcome contradicts the prediction, that is a *surprise*: the
+     executive is consulted on the next step, and writes need its backing for
+     a few steps.
+3. **Stop** on a finish, after `maxSteps`, when the model-call budget runs
+   out, when nothing moves even after the executive was consulted, or when the
+   `AbortSignal` fires.
+4. **Answer.** A finish that cites a successful action is *verified*: a
+   narrator writes the answer from the recorded trace, and its citations are
+   checked against real record ids. A finish with no tool evidence is
+   *answer-only* and returned as written. Every turn is stored as an episode.
 
-  Without a decision model, or when an answer is missing, malformed or the
-  call fails, the harness uses deterministic rules: wake every specialist
-  with relevant news, and escalate on "novelty" when the first step produced
-  nothing.
+An abbreviated trace from the scripted test scenario
+(`test/fixtures/export-incident.ts`). A remembered claim says export failures
+are usually quota problems, the goal is "Why did last night's nightly export
+job fail?", and the task is pinned read-only:
 
-```mermaid
-flowchart TB
-    IN["Turn input<br/>text, images, audio/video clips, live streams"] --> PER
-    PER["Perceive (bounded, before any step)<br/>goal + constraints<br/>audio/video: LiveModel, one perception record per stream<br/>memory recall: Embedder"] --> ST
-    ST[("StateStore<br/>append-only event log on Storage")]
-    subgraph STEP["Each step"]
-        HAB["Habits<br/>approved read-only shortcut (code)"]
-        ROUTE{{"Route<br/>DECISION: P(wake) per specialist<br/>fallback: wake all with news"}}
-        SPEC["Specialists x N<br/>GENERATION: fast LLM, in parallel<br/>observations, actions, finish"]
-        ESC{{"Escalate?<br/>hard reasons (code), else<br/>DECISION: P(escalate)<br/>fallback: novelty rule"}}
-        EXEC["Executive<br/>GENERATION: reasoning LLM<br/>diagnosis, focus, proposals"]
-        SEL["Selector (code)<br/>policy filter, ranking<br/>at most one action or finish"]
-        ACT["Actuator (code)<br/>policy re-check, runs the tool"]
-    end
-    ST --> ROUTE --> SPEC --> ESC --> EXEC --> SEL
-    HAB --> SEL
-    ESC -->|no| SEL
-    SEL --> ACT --> TP["ToolPort"]
-    ACT -->|"record act-N; expected outcome to the actor,<br/>surprise or failure to everyone"| ST
-    SEL -->|finish| NAR["Narrator<br/>GENERATION: answer with citations"]
+```text
+step 1
+  reflex read_job_logs({"job":"nightly-export"}): approved read-only habit hb-1; deliberation skipped
+  #5 [actuator] act-1 read_job_logs(…) -> ok (73 chars): 02:14 nightly-export: worker exceeded 30m timeout …
+step 2
+  wake [triage, ops, data] in parallel on fast-small
+  #8 [policy] blocked restart_job({"job":"nightly-export"}): c-1 read-only: investigation only; …
+  select check_quota({"project":"acme-analytics"}): origin=specialist, kind=read, …
+  #9 [actuator] act-2 check_quota(…) -> ok (33 chars): storage quota usage 41% (healthy) (SURPRISE)
+step 3
+  wake [triage, ops, data] in parallel on fast-small
+  escalate (surprise) -> executive on reasoner
+  select get_input_stats({"job":"nightly-export"}): origin=executive, kind=read, …
+step 4
+  wake [triage, ops, data] in parallel on fast-small
+  select finish: origin=specialist, kind=verified finish, …
+end: finished (verified) after 4 steps; episode ep-2
 ```
 
-Hexagons are decisions (typed probabilities, no text). Boxes marked
-GENERATION are LLM calls. Everything else is deterministic code.
+The triage specialist predicted that the quota check would show "exceeded".
+It did not, so the executive was consulted and redirected the investigation to
+input volume. The restart proposed by `ops` was blocked by the read-only
+constraint and never reached the tool.
 
-## Setup
+### Between turns: sleep and idle
 
-Requires [Bun](https://bun.sh).
+Two more functions work on stored memory. Both are ordinary `async` functions
+that **you call**, for example between tasks or from your own job. The harness
+never schedules them and never runs them in the background.
+
+Run sleep between turns, with one writer at a time. Concurrent memory updates
+are not protected by transactions or locks: ID allocation and read–modify–write
+updates can race, and the file adapter does not support concurrent writers.
+An async function is not, by itself, safe to run alongside another writer.
+
+- `consolidate()` ("sleep") replays unconsolidated episodes, with surprising
+  ones first, and asks a model for lessons and habit candidates. A lesson is
+  kept only if it cites episodes that were actually replayed. Habits are
+  registered as *pending* until someone calls `harness.habits.approve(id)`
+  (an opt-in flag, `autoApproveReadOnlyHabits`, approves read-only ones). A
+  habit whose outcome surprises is suspended.
+- `idle()` asks a model for at most a couple of ideas, using recent knowledge
+  and episodes. It has no tools. You can pass its ideas to a later turn as
+  `preparedIdeas`, and they enter the workspace at low priority.
+
+## Quick start
+
+Requires [Bun](https://bun.sh) (checked with 1.4.4).
 
 ```sh
 bun install
-bun run check    # strict typecheck + all tests (no network)
+bun run check   # tsc --noEmit, then bun test (offline: models are scripted test doubles)
 ```
 
-### Interactive chat example
-
-`examples/chat.ts` talks to any OpenAI-compatible chat completions API. It
-uses real read-only tools scoped to the current directory (`current_time`,
-`list_files`, `read_file`) and stores sessions and memory in `.brain-data/`.
+To chat with real models over any OpenAI-compatible API:
 
 ```sh
-OPENAI_BASE_URL=https://api.openai.com/v1 \
-OPENAI_API_KEY=sk-... \
-FAST_MODEL=<small fast model> \
-REASONING_MODEL=<reasoning model> \
+OPENAI_BASE_URL=https://api.openai.com/v1 OPENAI_API_KEY=... \
+FAST_MODEL='your-fast-model' REASONING_MODEL='your-reasoning-model' \
 bun run chat
 ```
 
-| Variable | Required | Meaning |
-| --- | --- | --- |
-| `OPENAI_BASE_URL` | yes | API base URL, including `/v1` if your provider uses it |
-| `OPENAI_API_KEY` | yes | Bearer token |
-| `FAST_MODEL` | yes | Model for the specialists and the narrator |
-| `REASONING_MODEL` | yes | Model for the executive and offline consolidation |
-| `EMBEDDING_MODEL` | no | Enables memory recall by cosine similarity |
-| `VISION` | no | `reasoning` or `all`: which profiles accept images (default: none) |
-| `SEND_REASONING_EFFORT` | no | `1` sends `reasoning_effort` (only for models that accept it) |
-| `FAST_SERVICE_MODE` | no | `standard` (default), `fast` or `ultrafast` lane for the fast profile |
-| `SERVICE_TIER_FAST` | no | Provider `service_tier` value for the `fast` lane, if it has one |
-| `SERVICE_TIER_ULTRAFAST` | no | Provider `service_tier` value for the `ultrafast` lane, if it has one |
-| `CONTEXT_WINDOW` | no | Context window of both models in tokens (default 128000) |
-| `BRAIN_DATA` | no | Storage directory (default `.brain-data`) |
+The chat example has two specialists (a direct responder and a file reader)
+and three read-only tools scoped to the current directory: `current_time`,
+`list_files` and `read_file`. It stores sessions and memory in `.brain-data/`.
+Commands:
 
-Chat commands: `/image <path>` attaches an image to the next message, `/new`
-starts a new task, `/sleep` consolidates past episodes into knowledge, `/quit`
-exits. The example runs without a decision model or a live media model,
-because no adapters for them ship with this project.
+- `/image <path>` attaches an image to your next message.
+- `/new` makes the next message start a new task.
+- `/sleep` runs `consolidate()`.
+- `/quit` exits.
+
+Optional settings (embeddings, vision, service tiers, context window) are
+listed at the top of `examples/chat.ts`. It runs without a decision model and
+without audio/video, because no adapters for those ship here.
 
 ## Using it in code
 
+Save this as `examples/minimal.ts` and run `bun examples/minimal.ts` with the
+same environment variables as the chat example:
+
 ```ts
-import { Harness, FunctionTools, type ModelProfile, type DecisionModel, type LiveModel, type MediaPart } from "./src/index.ts";
-import { OpenAICompatibleLlm } from "./src/adapters/openai-compatible.ts";
-import { FileStorage } from "./src/adapters/file-storage.ts";
+import { OpenAICompatibleLlm } from "../src/adapters/openai-compatible.ts";
+import { FunctionTools, Harness, type ModelProfile } from "../src/index.ts";
 
-const fast: ModelProfile = { id: "fast", model: "my-small-model", tier: "fast", reasoningEffort: "none", serviceMode: "standard", contextWindow: 128_000, maxOutputTokens: 1_000 };
-const reasoning: ModelProfile = { id: "reasoning", model: "my-reasoning-model", tier: "reasoning", reasoningEffort: "medium", serviceMode: "standard", contextWindow: 128_000, maxOutputTokens: 4_000 };
-
-declare const decisionModel: DecisionModel;          // your adapter, optional
-declare const liveModel: LiveModel;                  // your adapter, needed only for audio/video
-declare const microphone: AsyncIterable<MediaPart>;  // e.g. audio chunks until the user stops talking
+const fast: ModelProfile = {
+  id: "fast", model: process.env.FAST_MODEL!, tier: "fast", reasoningEffort: "none",
+  serviceMode: "standard", contextWindow: 128_000, maxOutputTokens: 1_000,
+};
+const reasoning: ModelProfile = {
+  id: "reasoning", model: process.env.REASONING_MODEL!, tier: "reasoning", reasoningEffort: "medium",
+  serviceMode: "standard", contextWindow: 128_000, maxOutputTokens: 4_000,
+};
 
 const harness = new Harness({
-  llm: new OpenAICompatibleLlm({ baseUrl: "https://api.example.com/v1", apiKey: "..." }),
+  llm: new OpenAICompatibleLlm({ baseUrl: process.env.OPENAI_BASE_URL!, apiKey: process.env.OPENAI_API_KEY! }),
   profiles: { fast, reasoning },
-  tools: [{ name: "get_status", description: "Current status of a service", effect: "read", params: { service: { type: "string", description: "service name" } } }],
-  toolPort: new FunctionTools({ get_status: (args) => `ok: ${String(args.service)}` }),
-  specialists: [{ name: "ops", instructions: "Check service status and answer status questions.", tools: ["get_status"], canFinish: true }],
-  storage: new FileStorage(".brain-data"),
-  decisions: { model: decisionModel, wakeThreshold: 0.5, escalateThreshold: 0.6 },
-  live: liveModel,
+  tools: [{ name: "current_time", description: "Current date and time (ISO 8601, UTC)", effect: "read", params: {} }],
+  toolPort: new FunctionTools({ current_time: () => new Date().toISOString() }),
+  permissions: { allowEffects: ["read"] },
+  specialists: [{
+    name: "clock",
+    instructions: "Answer questions about the time with current_time. Finish citing the act-id.",
+    tools: ["current_time"],
+    canFinish: true,
+  }],
 });
 
-const session = await harness.openSession("support-chat");
-const result = await session.turn({ input: "Is the billing service up?" });
-console.log(result.status, result.completion, result.answer.text);
-
-// Live audio: the stream is read during perception, then the steps run.
-await session.turn({ input: "Listen to this", live: [{ medium: "audio", mimeType: "audio/pcm", chunks: microphone }] });
+const result = await harness.run({ input: "What time is it in UTC?" });
+console.log(result.answer.text);
+console.log(result.status, result.completion);
+console.log(result.trace.join("\n"));
 ```
 
-`RunResult` also returns the trace, every model call with its profile, every
-decision request with its typed answers, the actions taken, token usage, and
-the session's state.
+Each tool declares whether its `effect` is `read` or `write`. `permissions`
+sets which effects this deployment may run at all; **the default allows
+both**. Constraints passed to a turn (`read_only`, `deny_tool`, or a plain
+`instruction`) narrow that further for one task. `RunResult` also returns the
+executed `actions`, the appended `events`, every `modelCalls` entry with its
+tier, the `decisions`, and token `usage`.
 
-## Architecture and source guide
+For a conversation, open a session and keep calling `turn`. Agents keep their
+transcripts between turns. `newTask: true` clears the workspace and
+constraints and starts fresh transcripts:
 
-One turn (`src/session.ts`) reads top to bottom: **perceive**, then each
-step: **habits, route + specialists, escalate, select, act/route the outcome
-or finish**, then **wrap up** (narrate and store the episode). Each part is a
-small named method.
+```ts
+import { consolidate, idle } from "../src/index.ts";
 
-| Path | What it holds |
-| --- | --- |
-| `src/io/content.ts` | Content parts: `text`, `image`, `audio`, `video` |
-| `src/io/llm.ts` | `LlmClient` port, `ModelProfile` (tier, reasoning effort, service lane), `chooseProfile`, `withUrgency` |
-| `src/io/decision.ts` | `DecisionModel` port, typed questions and answers, `checkDecisions` |
-| `src/io/live.ts` | `LiveModel` port, `LiveInput` streams, bounded `takeObservations` |
-| `src/io/embeddings.ts`, `src/io/storage.ts` | `Embedder` port and cosine similarity; async `Storage` port and `MemoryStorage` |
-| `src/adapters/` | `OpenAICompatibleLlm`, `OpenAICompatibleEmbedder` (plain `fetch`), `FileStorage` (`node:fs`) |
-| `src/session.ts` | The turn loop |
-| `src/harness.ts` | Configuration, defaults, shared services, `openSession()` / `run()` |
-| `src/state.ts` | Event log fold, snapshot with evidence index, event rendering |
-| `src/transcript.ts` | Append-only per-agent transcripts and compaction |
-| `src/agents.ts` | Shared and role prompts, `Agent` |
-| `src/validate.ts` | Validation of model output into proposals |
-| `src/selector.ts` | Policy filter and ranking |
-| `src/tools.ts` | `ToolSpec`, `ToolPort`, `FunctionTools`, policy checks, `Actuator` |
-| `src/monitor.ts` | Surprise detection, escalation reasons, stall detection |
-| `src/memory.ts` | Episodic, knowledge and habit stores |
-| `src/narrator.ts` | Final answer with citation checks |
-| `src/consolidation.ts`, `src/background.ts` | Offline consolidation into knowledge and pending habits; idle idea generation (never runs tools) |
-| `examples/chat.ts` | Interactive chat over a real provider |
-| `test/` | Tests; `test/fixtures/` holds the only scripted test doubles |
+const session = await harness.openSession("demo");
+await session.turn({ input: "Why did the nightly export fail?" });
+await session.turn({ input: "Summarise that in one sentence." });
+await session.turn({ input: "Different question: what files are here?", newTask: true });
 
-### Models, roles and service lanes
+// Later, when you decide to (consolidate and idle are exported from src/index.ts):
+const { llm } = harness.config;
+const sleep = await consolidate({
+  llm, profile: reasoning, tools: harness.config.tools,
+  episodes: harness.episodes, knowledge: harness.knowledge, habits: harness.habits,
+});
+console.log(sleep.learned, sleep.habitsProposed); // habits stay pending until approved
+const { ideas } = await idle({ llm, profile: fast, knowledge: harness.knowledge, episodes: harness.episodes });
+await session.turn({ input: "Did tonight's export finish?", preparedIdeas: ideas });
+```
 
-- A `ModelProfile` has three independent settings: `tier` (`fast` or
-  `reasoning`), `reasoningEffort`, and `serviceMode`, the provider latency
-  lane (`standard`, `fast` or `ultrafast`).
-- `chooseProfile(profiles, role)` is the single place that maps roles to
-  profiles. An agent keeps its profile for life, so its transcript never
-  changes model.
-- `urgency: "high"` only raises a `standard` lane to `fast`. It never changes
-  the model, tier or effort, and never downgrades `ultrafast`.
-- The OpenAI-compatible adapter sends a `service_tier` value only for lanes
-  you configure (`serviceTiers: { fast, ultrafast }`). An unconfigured lane is
-  sent as the provider default.
+### Model profiles and service modes
 
-### Prompts and caching
+A `ModelProfile` sets three independent things. `tier` is the model class
+(`fast` for specialists and the narrator, `reasoning` for the executive).
+`reasoningEffort` is how much the model thinks per call. `serviceMode` is the
+provider latency lane: `standard`, `fast` or `ultrafast`, which changes how
+quickly a request is served, not which model serves it.
 
-- **System prompt order:** first a shared block (rules, tools sorted by name,
-  reply schema), identical for every agent, then the agent's role block.
-- **Append-only transcripts:** each call appends one user message with the
-  events this agent may see since its last call, plus private notes. Earlier
-  messages are never rewritten.
-- **Compaction** starts a new epoch with a fresh state snapshot and a short
-  tail of the agent's own replies. No summarizing model call is made. It
-  happens just before the next request (plus its output reserve) would
-  overflow, or when the provider returns a `cacheExpiresAt` hint that has
-  passed and the transcript is large. No cache lifetime is assumed, and a
-  cache hit is never guaranteed.
-- **Atomic:** if even a fresh snapshot does not fit, `ContextBudgetError` is
-  thrown and the transcript is left unchanged.
-- **Sessions:** transcripts carry across a session's turns, so a new message
-  is just another delta. `newTask: true` clears the workspace and constraints
-  and starts fresh epochs. A session reopened from storage rebuilds its state
-  from the event log.
+A turn with `urgency: "high"` moves `standard` profiles to `fast` and leaves
+the model, tier and effort alone. The OpenAI-compatible adapter sends a
+`service_tier` only for lanes you map in `serviceTiers`. Otherwise the
+provider's default lane is used.
 
-### Evidence, completion and arbitration
+## Architecture
 
-- Tool outputs are stored in full as records (`act-N`); audio/video
-  observations as perception records (`per-N`). Agents see previews and can
-  propose `{"kind":"read_record","id":"act-N","offset":0}` to receive a chunk
-  privately on their next turn.
-- Every snapshot carries an evidence index (id, call, size, preview), so
-  records stay reachable after compaction. The index is global: an agent can
-  see that a record routed to someone else exists.
-- A finish is **verified** if it cites a successful action record, and
-  **answer-only** otherwise (for example a direct question that needs no
-  tools). A finish citing unknown ids is rejected. Perceptions never make a
-  finish verified.
-- The selector ranks candidates by origin (executive > habit > specialist),
-  then kind (verified finish > read > write > answer-only finish), then
-  support from distinct model profiles. A tie involving a write holds and
-  escalates as a conflict. At most one action or finish is released per step.
-- Verified finishes are narrated with citation checks. Answer-only finishes
-  are returned as written (`grounded: false`).
+All session state is a fold over an append-only event log stored through the
+`Storage` port, so a session can be reopened by id. Agents do not share a
+transcript: each receives the events it is allowed to see as text appended to
+its own. If a specialist's action turns out as predicted, the outcome
+goes only to that specialist. Surprises and failures are broadcast. Long tool
+outputs are shown as previews, and an agent can ask to read the full record in
+private.
 
-### Repeats, outcome routing and stalls
+| Port | You provide | Shipped |
+| --- | --- | --- |
+| `LlmClient` | chat completions for every agent | `OpenAICompatibleLlm` |
+| `DecisionModel` | typed probabilities for routing/escalation (optional) | none |
+| `Embedder` | vectors for memory recall (optional) | `OpenAICompatibleEmbedder` |
+| `LiveModel` | `AsyncIterable` media chunks → text observations (optional) | none |
+| `Storage` | key/value + append-only logs | `MemoryStorage`, `FileStorage` |
+| `ToolPort` | runs a tool call | `FunctionTools` |
 
-- An identical read may run again after a write, or in a new turn. An
-  identical write runs at most once per turn.
-- An expected outcome of a specialist's action goes only to the specialists
-  who proposed it. Surprises, failures, and executive or habit actions go to
-  everyone and enter the workspace.
-- Progress means an action, a delivered record, executive focus, a new
-  outcome, or a goal or constraint change. Rephrased observations do not
-  count. A stuck turn stops after `stallSteps` idle steps once the executive
-  has been consulted.
+Source map (`src/`):
 
-### Images, audio and video
+- `harness.ts` holds configuration, limits and shared services. `session.ts`
+  holds the turn loop.
+- `agents.ts` builds agent prompts, with a shared block first and the role
+  last so prefixes match. `transcript.ts` keeps per-agent append-only
+  transcripts and handles compaction.
+- `state.ts` holds the event log, workspace and evidence index. `types.ts`
+  holds the shared data shapes.
+- `selector.ts` ranks proposals. `tools.ts` has the policy gate and the
+  actuator. `monitor.ts` tracks surprise, stalls and escalation reasons.
+- `validate.ts` checks model output at the boundary. `narrator.ts` writes the
+  grounded answer.
+- `memory.ts` has the episode, knowledge and habit stores. `consolidation.ts`
+  is sleep and `background.ts` is idle.
+- `io/` holds the provider-neutral ports. `adapters/` holds the
+  OpenAI-compatible and file-storage implementations.
 
-- Images go only to profiles with `vision: true`. If only the reasoning
-  profile has vision, the executive is consulted before any action is
-  released, and text-only specialists are told the media is not visible to
-  them. If the executive cannot look (no executive calls allowed, not enough
-  model-call budget, or its call fails until the cap), no action is released.
-- Audio and video never go to chat models. They go to an injected
-  `LiveModel`, which reads an `AsyncIterable` of media chunks and yields text
-  observations. A recorded clip in `input` becomes a one-chunk stream; live
-  sources are passed as `live: [{ medium, mimeType, chunks }]`.
-- **Perception is a bounded phase before the steps start**, not concurrent
-  real-time cognition. Each stream is read until the caller ends it or until
-  `limits.maxLiveObservations` observations; the model's stream is then
-  closed, so a well-behaved `LiveModel` stops reading input. Aborting the
-  turn's `signal` ends it as `cancelled` even if the source is waiting for
-  more input. Each stream becomes one perception record, and the workspace
-  gets one pointer to it.
-- Media the configuration cannot handle is rejected up front with
-  `UnsupportedContentError`. Adapters reject it too.
+Tests in `test/` use scripted models, a scripted decision model and a
+word-hash embedder. They check behaviour (policy, routing, prefix stability,
+compaction, persistence, media handling), not model quality.
 
-### Memory and persistence
+## Current limitations
 
-- `EpisodicStore`, `KnowledgeStore` (with provenance) and `HabitStore` are
-  async and live on `Storage`, as does each session's event log.
-- Recall needs an `Embedder`: items are embedded when written and ranked by
-  cosine similarity (`recall.minSimilarity` depends on the embedding model).
-  Without an embedder nothing is recalled. Recalled items enter as unverified
-  claims.
-- Habits fire on an exact, case-insensitive trigger phrase in the goal. They
-  come from offline consolidation as pending and need approval
-  (`autoApproveReadOnlyHabits` is off by default). A surprising outcome
-  suspends a habit.
-
-## Implemented versus injected
-
-| Kind | Pieces |
-| --- | --- |
-| **Ports you implement or inject** | `LlmClient`, `DecisionModel`, `LiveModel`, `Embedder`, `Storage`, `ToolPort` |
-| **Real implementations included** | Turn loop, selector, actuator and policy checks, monitor, transcripts, event log, memory stores, consolidation, idle ideas, `MemoryStorage`, `FunctionTools` |
-| **Real adapters included** | `OpenAICompatibleLlm` and `OpenAICompatibleEmbedder` (plain `fetch`), `FileStorage` (JSON files and JSON-lines logs) |
-| **Not included** | No `DecisionModel` adapter (no TypeSafe/Jev or other decision-model integration). No `LiveModel` adapter. Without them, routing is deterministic and audio/video input is rejected. |
-| **Test-only doubles** (`test/fixtures/`) | `ScriptedLlm`, `ScriptedDecisions`, `WordHashEmbedder`, a fictional incident scenario, inline `LiveModel` doubles. None are exported from `src/`. |
-
-## Limitations
-
-- **Nothing has run against a live provider.** The OpenAI-compatible adapter
-  is tested only through an injected `fetch`, and `examples/chat.ts` has not
-  been run in CI. No decision model or live media model has been exercised;
-  all tests use scripted doubles. There are no benchmarks, so claims about
-  cost or quality are design intent, not measurements.
-- Decision requests (at most two per step) are not counted against
-  `maxModelCalls`. Their probabilities are used as given; calibration depends
-  on the model you inject.
-- The decision model sees the full state snapshot and recent events,
-  including outcomes routed privately to one specialist.
-- A `LiveModel` that ignores its abort signal can keep waiting on a stalled
-  source after the turn has been cancelled.
-- Token counts use a rough estimator (`characters / 4`) unless you inject a
-  tokenizer; images use a flat estimate.
-- `StateStore.apply` updates the in-memory view before the storage write
-  finishes. If the write fails, the turn throws and a reopened session will
-  not contain that event. `FileStorage` assumes a single process.
-- Not included: vector index or forgetting, provider-native structured
-  output, long-running tools, full-duplex real-time speech.
-
-## Tests
-
-`bun run check` runs the strict typecheck and every test, with no network.
-
-| Behavior | Test file |
-| --- | --- |
-| Typed decision answers; invalid or missing answers dropped; routing skips specialists; escalation by judgment; fallbacks; hard reasons and policy ignore probabilities | `decisions.test.ts` |
-| Shared prompt prefix byte-identical across agents, role last | `session.test.ts` |
-| Append-only deltas, overflow and cache-expiry compaction, evidence index kept, atomic failure and recovery | `transcript.test.ts` |
-| Expected outcomes to the actor only, surprises broadcast; `read_record` chunks across compaction | `session.test.ts` |
-| Answer-only completion and finish arbitration | `session.test.ts`, `selector.test.ts` |
-| Repeat rules; sessions across turns; stall detection | `session.test.ts`, `harness.test.ts` |
-| No media reaches an incapable model; executive sees images before any action; budget and failure cases | `session.test.ts`, `adapters.test.ts` |
-| Audio clip through a `LiveModel`; live source read lazily, closed at the bound; cancellation while a source waits | `session.test.ts` |
-| Service lanes, `ultrafast` kept under urgency, adapter maps only configured lanes | `harness.test.ts`, `adapters.test.ts` |
-| File storage round trip; session and memory survive a restart | `adapters.test.ts` |
-| Embedding recall by cosine similarity; none without an embedder | `memory.test.ts` |
-| Policy gate, reflex habits, budgets, cancellation, end-to-end scenario | `harness.test.ts` |
+- **No live provider tests.** The OpenAI-compatible adapter is only checked
+  against an injected `fetch`. Cache reuse is never measured: the
+  "cached" token counts in tests are simulated, and real cache hits depend on
+  the provider.
+- **No decision-model or live-model adapter.** Without a decision model,
+  routing is rule-based: every specialist with visible news wakes on each
+  step. In the trace above, `ops` and `data` are called every step even when
+  they have nothing to say.
+- **Only the turn loop runs by itself.** Sleep and idle are explicit calls.
+  There is no scheduler or background worker, and the harness runs nothing
+  alongside a turn. The only concurrency is the parallel specialist calls
+  within a step. Escalation is not an interrupt: a surprise is handled on the
+  next step, after another specialist round. Audio/video perception is a
+  bounded phase before the steps, not a stream that runs alongside them.
+- **Budgets cover chat calls only.** Decision-model calls and
+  consolidate/idle calls do not count toward `maxModelCalls` or a turn's
+  `usage`.
+- **Persistence is simple.** Transcripts live in memory, so a reopened
+  session rebuilds each agent's prompt from a fresh snapshot. Each session
+  runs one turn at a time; callers must serialize turns on a shared session.
+  Memory updates are not concurrency-safe, and `FileStorage` is intended for a
+  single process without concurrent writers. If a storage write
+  fails, the turn ends, and the log may be missing an event the in-memory
+  view already saw.
+- **Rough estimates and simple matching.** Tokens are estimated as
+  characters ÷ 4, and each image counts as a flat 1,000 tokens. Habits fire on
+  a case-insensitive substring of the goal. Recall is brute-force cosine
+  similarity with a `minSimilarity` you need to tune for your embedder.
+- **"Grounded" means only that the cited ids exist.** It does not check that
+  the evidence supports the prose. Approving habits is left to you; the chat
+  example has no approval command.
