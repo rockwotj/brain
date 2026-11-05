@@ -6,9 +6,12 @@ built to be read and tinkered with, not tuned or hardened. The design rationale 
 
 ```sh
 bun install
-bun run demo        # offline walkthrough with toy models (no API keys)
-bun test            # 17 tests
+bun test            # unit tests for the context, workspace and selector
 bun run typecheck
+
+# chat with it over any OpenAI-compatible API
+OPENAI_BASE_URL=https://api.openai.com/v1 OPENAI_API_KEY=... \
+SYSTEM1_MODEL=... SYSTEM2_MODEL=... EMBEDDING_MODEL=... bun run chat
 ```
 
 ## The idea in one paragraph
@@ -72,8 +75,6 @@ Goals flow **down**: the overseer posts goal bids for the planner, and goal chan
 - **Shared prompts for fixed tasks.** The reflex, judge, risk and summarizer prompts are constant, so they stay cached across calls.
 - **Tier changes are cache misses.** Caches are per model, so switching tiers forces an uncached call. Each loop stays on its default tier unless the monitor escalates it.
 
-The toy models simulate a prefix cache, so the demo reports how much input came from the cache.
-
 ## System 1 / System 2
 
 `Models` has two tiers plus optional live and embedding models:
@@ -107,10 +108,11 @@ Everything external sits behind small interfaces in `src/io/`:
 
 Adapters in `src/adapters/`:
 
-- `scripted-llm.ts`: fake model with a simulated prefix cache, for tests and the demo
-- `hash-embedder.ts`: deterministic bag-of-words embeddings, not semantic
 - `file-storage.ts`: one JSON file per key
 - `openai-compatible.ts`: chat and embeddings over plain `fetch`. Untested against live endpoints.
+
+`MemoryStorage` (in `io/storage.ts`) keeps everything in process memory. There's no live-model
+adapter yet, so audio/video input needs one before it works.
 
 ```ts
 const brain = await Brain.create({
@@ -126,7 +128,8 @@ await brain.idle();  // reminders + sleep
 
 ## Status and known gaps
 
-- Verified only with toy scripted models: the demo and 17 unit tests. Not run against real models, and not benchmarked.
+- Verified by type-checking and unit tests of the stable context, workspace and selector. The full brain loop and the OpenAI-compatible adapter have not been run against real models, and nothing is benchmarked.
+- No live-model adapter, so audio/video input isn't usable yet.
 - Memory search compares against every stored item. There is no vector index and no forgetting or pruning yet.
 - Actions run one tick at a time. There are no long-running or streaming tools.
 - The live model returns text observations only. There is no keyframe pass-through or barge-in.

@@ -5,7 +5,7 @@
   "type": "module",
   "private": true,
   "scripts": {
-    "demo": "bun examples/demo.ts",
+    "chat": "bun examples/chat.ts",
     "test": "bun test",
     "typecheck": "tsc --noEmit"
   },
