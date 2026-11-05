@@ -1,0 +1,22 @@
+{
+  "name": "brain-harness",
+  "version": "0.1.0",
+  "description": "Proof-of-concept LLM agent harness: bounded workspace, cheap parallel specialists, an on-demand executive, a policy-gated actuator and two-speed memory.",
+  "private": true,
+  "type": "module",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "bun test",
+    "demo": "bun examples/demo.ts",
+    "check": "bun run typecheck && bun test && bun run demo"
+  },
+  "devDependencies": {
+    "@types/bun": "1.4.4",
+    "typescript": "5.9.3"
+  }
+}
