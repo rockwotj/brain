@@ -16,7 +16,8 @@
  *   BRAIN_DATA=.brain-data        directory for sessions, records and memory
  *
  * Commands: /image <path> (attach to the next message), /new (task boundary),
- * /sleep (consolidate episodes into knowledge), /quit.
+ * /sleep (consolidate episodes into knowledge), /idle (prepare ideas for the
+ * next message), /quit.
  * Audio/video and decision models: no adapters ship with this PoC, so this
  * example runs without them (deterministic routing; no audio/video input).
  */
@@ -102,6 +103,11 @@ while (true) {
   if (line === "/sleep") {
     const report = await consolidate({ llm, profile: reasoning, episodes: harness.episodes, knowledge: harness.knowledge, habits: harness.habits, tools });
     console.log(`replayed ${report.replayed.length} episodes, learned ${report.learned.length}, habits proposed ${report.habitsProposed.length} (pending approval)`);
+    continue;
+  }
+  if (line === "/idle") {
+    const { ideas } = await session.idle();
+    console.log(ideas.length ? `ideas for your next message: ${ideas.join(" | ")}` : "(no ideas)");
     continue;
   }
   if (line.startsWith("/image ")) {

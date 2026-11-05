@@ -108,9 +108,10 @@ constraint and never reached the tool.
 
 ### Between turns: sleep and idle
 
-Two more functions work on stored memory. Both are ordinary `async` functions
-that **you call**, for example between tasks or from your own job. The harness
-never schedules them and never runs them in the background.
+Two more calls work between turns. Both are ordinary `async` calls that
+**you make**, for example between tasks or from your own job. The harness
+never schedules them and never runs them in the background. `session.idle()`
+refuses to run while that session's turn is in progress.
 
 Run sleep between turns, with one writer at a time. Concurrent memory updates
 are not protected by transactions or locks: ID allocation and read–modify–write
@@ -123,9 +124,16 @@ An async function is not, by itself, safe to run alongside another writer.
   registered as *pending* until someone calls `harness.habits.approve(id)`
   (an opt-in flag, `autoApproveReadOnlyHabits`, approves read-only ones). A
   habit whose outcome surprises is suspended.
-- `idle()` asks a model for at most a couple of ideas, using recent knowledge
-  and episodes. It has no tools. You can pass its ideas to a later turn as
-  `preparedIdeas`, and they enter the workspace at low priority.
+- `session.idle()` asks the fast model for at most a couple of ideas, using
+  the session's most recent goal plus recent knowledge and episodes. It has no
+  tools. The ideas are stored with the session (under
+  `sessions/<id>/pending-ideas` in `Storage`), so they survive reopening it.
+  The session's next turn admits them to the workspace at low priority and
+  clears them, so each idea is used once. Another `idle()` before that turn
+  replaces them; a turn with `newTask: true` discards them, since they were
+  prepared for the previous task; other sessions never see them. The
+  stateless `idle()` function underneath returns ideas without storing
+  anything, if you only want to look at them.
 
 ## Quick start
 
@@ -152,6 +160,7 @@ Commands:
 - `/image <path>` attaches an image to your next message.
 - `/new` makes the next message start a new task.
 - `/sleep` runs `consolidate()`.
+- `/idle` runs `session.idle()`; its ideas join your next message's turn.
 - `/quit` exits.
 
 Optional settings (embeddings, vision, service tiers, context window) are
@@ -205,25 +214,26 @@ tier, the `decisions`, and token `usage`.
 
 For a conversation, open a session and keep calling `turn`. Agents keep their
 transcripts between turns. `newTask: true` clears the workspace and
-constraints and starts fresh transcripts:
+constraints (and any pending idle ideas) and starts fresh transcripts:
 
 ```ts
-import { consolidate, idle } from "../src/index.ts";
+import { consolidate } from "../src/index.ts";
 
 const session = await harness.openSession("demo");
 await session.turn({ input: "Why did the nightly export fail?" });
 await session.turn({ input: "Summarise that in one sentence." });
 await session.turn({ input: "Different question: what files are here?", newTask: true });
 
-// Later, when you decide to (consolidate and idle are exported from src/index.ts):
+// Later, when you decide to:
 const { llm } = harness.config;
 const sleep = await consolidate({
   llm, profile: reasoning, tools: harness.config.tools,
   episodes: harness.episodes, knowledge: harness.knowledge, habits: harness.habits,
 });
 console.log(sleep.learned, sleep.habitsProposed); // habits stay pending until approved
-const { ideas } = await idle({ llm, profile: fast, knowledge: harness.knowledge, episodes: harness.episodes });
-await session.turn({ input: "Did tonight's export finish?", preparedIdeas: ideas });
+const { ideas } = await session.idle(); // stored with the session
+console.log(ideas);
+await session.turn({ input: "Did tonight's export finish?" }); // admits those ideas once
 ```
 
 ### Model profiles and service modes
@@ -272,7 +282,7 @@ Source map (`src/`):
 - `validate.ts` checks model output at the boundary. `narrator.ts` writes the
   grounded answer.
 - `memory.ts` has the episode, knowledge and habit stores. `consolidation.ts`
-  is sleep and `background.ts` is idle.
+  is sleep and `background.ts` is the idle reflector behind `session.idle()`.
 - `io/` holds the provider-neutral ports. `adapters/` holds the
   OpenAI-compatible and file-storage implementations.
 
@@ -303,7 +313,9 @@ compaction, persistence, media handling), not model quality.
   session rebuilds each agent's prompt from a fresh snapshot. Each session
   runs one turn at a time; callers must serialize turns on a shared session.
   Memory updates are not concurrency-safe, and `FileStorage` is intended for a
-  single process without concurrent writers. If a storage write
+  single process without concurrent writers. Pending idle ideas are admitted
+  and then cleared in two separate writes, so a crash in between can admit
+  them a second time. If a storage write
   fails, the turn ends, and the log may be missing an event the in-memory
   view already saw.
 - **Rough estimates and simple matching.** Tokens are estimated as

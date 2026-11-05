@@ -9,8 +9,12 @@
  * Routing and the escalation judgment use the optional DecisionModel (typed
  * probabilities, no generated text) and fall back to deterministic rules.
  * Bounded by max steps, a model-call budget, stall detection and an AbortSignal.
+ *
+ * Between turns, `idle()` reflects and stores ideas in the session; the next
+ * turn admits them once at low priority.
  */
 import { makeAgent, type Agent, type SpecialistSpec } from "./agents.ts";
+import { idle, type IdleReport } from "./background.ts";
 import { describeMedia, isMedia, textOf, toParts, type ContentPart } from "./io/content.ts";
 import { checkDecisions, type DecisionAnswer, type DecisionQuestion } from "./io/decision.ts";
 import { embedOne } from "./io/embeddings.ts";
@@ -30,14 +34,14 @@ export type TurnOptions = {
   live?: readonly LiveInput[];
   constraints?: Constraint[];
   urgency?: "normal" | "high";
-  /** Ideas prepared while idle; admitted at low priority. */
-  preparedIdeas?: string[];
-  /** Task boundary: clear workspace and constraints, and start fresh transcript epochs. */
+  /** Task boundary: clear workspace, constraints and pending idle ideas, and start fresh transcript epochs. */
   newTask?: boolean;
   signal?: AbortSignal;
   /** Hook for injecting external events (e.g. a new user constraint) before each step. May be async. */
   onStep?: (step: number, state: StateStore) => unknown;
 };
+
+export type IdleOptions = { maxIdeas?: number; signal?: AbortSignal };
 
 export type ModelCall = { step: number; agent: string; profile: string; tier: ModelProfile["tier"] };
 /** One decision-model request: valid typed answers plus any issues (which fall back to the deterministic rule). */
@@ -153,8 +157,41 @@ export class Session {
     };
   }
 
+  /**
+   * Idle reflection between turns: ask the fast model for a few ideas (no tools)
+   * and store them in this session, replacing any earlier pending ideas. The next
+   * turn admits them to the workspace at low priority, once; `newTask` discards them.
+   */
+  async idle(opts: IdleOptions = {}): Promise<IdleReport> {
+    if (this.busy) throw new Error(`session ${this.id} is busy: a turn or idle() is already running`);
+    this.busy = true;
+    try {
+      const { llm, profiles } = this.h.config;
+      const report = await idle({
+        llm, profile: chooseProfile(profiles, "specialist"), knowledge: this.h.knowledge, episodes: this.h.episodes,
+        estimate: this.h.estimate,
+        ...(this.state.goal ? { goal: this.state.goal } : {}),
+        ...(opts.maxIdeas !== undefined ? { maxIdeas: opts.maxIdeas } : {}),
+        ...(opts.signal ? { signal: opts.signal } : {}),
+      });
+      await this.h.storage.put(this.ideasKey, report.ideas);
+      return report;
+    } finally {
+      this.busy = false;
+    }
+  }
+
+  /** Ideas waiting for the next turn. */
+  async pendingIdeas(): Promise<string[]> {
+    return (await this.h.storage.get<string[]>(this.ideasKey)) ?? [];
+  }
+
+  private get ideasKey(): string {
+    return `sessions/${this.id}/pending-ideas`;
+  }
+
   async turn(opts: TurnOptions): Promise<RunResult> {
-    if (this.busy) throw new Error(`session ${this.id}: a turn is already running`);
+    if (this.busy) throw new Error(`session ${this.id} is busy: a turn or idle() is already running`);
     this.busy = true;
     const t = (this.t = newTurn(this.h.limits.stallSteps, opts.signal));
     try {
@@ -216,7 +253,15 @@ export class Session {
     }
     await this.listen(streams, goal);
     await this.recallMemory(goal);
-    for (const idea of opts.preparedIdeas ?? []) await this.state.admit("background", { kind: "idea", content: idea, priority: "low", evidence: [] });
+    await this.admitPendingIdeas();
+  }
+
+  /** Ideas from the last `idle()` enter this turn at low priority, then are cleared. */
+  private async admitPendingIdeas(): Promise<void> {
+    const ideas = await this.pendingIdeas();
+    if (!ideas.length) return;
+    for (const idea of ideas) await this.state.admit("background", { kind: "idea", content: idea, priority: "low", evidence: [] });
+    await this.h.storage.put(this.ideasKey, []);
   }
 
   /**
@@ -254,6 +299,7 @@ export class Session {
   }
 
   private async startNewTask(): Promise<void> {
+    await this.h.storage.put(this.ideasKey, []); // ideas were prepared for the previous task
     for (const item of [...this.state.workspace]) await this.state.apply("user", { type: "workspace.evict", id: item.id, reason: "new task" });
     for (const c of this.state.pinned()) await this.state.apply("user", { type: "constraint.remove", id: c.id });
     for (const agent of [this.executive, this.narrator, ...this.specialists.map((s) => s.agent)]) {

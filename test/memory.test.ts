@@ -1,5 +1,9 @@
 import { describe, expect, test } from "bun:test";
-import { consolidate, EpisodicStore, FunctionTools, HabitStore, idle, KnowledgeStore, MemoryStorage } from "../src/index.ts";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { FileStorage } from "../src/adapters/file-storage.ts";
+import { consolidate, EpisodicStore, FunctionTools, HabitStore, idle, KnowledgeStore, MemoryStorage, type HarnessEvent, type LlmRequest } from "../src/index.ts";
 import { GOAL, makeScenario, READ_ONLY, FAST, REASONING, TOOLS } from "./fixtures/export-incident.ts";
 import { ScriptedLlm } from "./fixtures/scripted-llm.ts";
 import { WordHashEmbedder } from "./fixtures/word-hash-embedder.ts";
@@ -100,9 +104,77 @@ describe("idle background mind", () => {
     expect(llm.requests[0]!.messages[0]!.content).toContain("TOOLS: none");
   });
 
-  test("prepared ideas enter a later run at low priority", async () => {
-    const { harness } = build(() => reply());
-    const result = await harness.run({ input: "g", preparedIdeas: ["check volume first"] });
-    expect(result.state.workspace.find((i) => i.kind === "idea")?.priority).toBe("low");
+});
+
+describe("session idle", () => {
+  /** The idle reflector suggests ideas; every other agent stays silent. */
+  const ideaScript = (...ideas: string[]) => (r: LlmRequest) =>
+    r.agent === "background" ? reply(...ideas.map((content) => ({ kind: "observation", content }))) : reply();
+  const ideasIn = (events: HarnessEvent[]) =>
+    events.flatMap((e) => (e.delta.type === "workspace.admit" && e.delta.item.kind === "idea" ? [e.delta.item] : []));
+
+  test("next turn admits pending ideas automatically, at low priority, once", async () => {
+    const { harness, llm } = build(ideaScript("check volume first"));
+    const session = await harness.openSession("s-idle");
+    await session.turn({ input: "why did the export fail" });
+    const report = await session.idle();
+    expect(report.ideas).toEqual(["check volume first"]);
+    expect(await session.pendingIdeas()).toEqual(["check volume first"]);
+    const idleRequest = llm.requests.find((r) => r.agent === "background")!;
+    expect(JSON.stringify(idleRequest.messages)).toContain("Most recent goal: why did the export fail");
+
+    const second = await session.turn({ input: "did it finish tonight" });
+    const admitted = ideasIn(second.events);
+    expect(admitted.map((i) => [i.content, i.priority])).toEqual([["check volume first", "low"]]);
+    expect(await session.pendingIdeas()).toEqual([]);
+
+    const third = await session.turn({ input: "anything else" });
+    expect(ideasIn(third.events)).toEqual([]);
+  });
+
+  test("pending ideas survive reopening the session from file storage", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "brain-idle-"));
+    try {
+      const first = build(ideaScript("check volume first"), { storage: new FileStorage(dir) });
+      await (await first.harness.openSession("s-file")).idle();
+
+      const second = build(() => reply(), { storage: new FileStorage(dir) });
+      const reopened = await second.harness.openSession("s-file");
+      expect(await reopened.pendingIdeas()).toEqual(["check volume first"]);
+      const result = await reopened.turn({ input: "did it finish" });
+      expect(ideasIn(result.events).map((i) => i.content)).toEqual(["check volume first"]);
+      expect(await reopened.pendingIdeas()).toEqual([]);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("ideas stay in the session that prepared them", async () => {
+    const { harness } = build(ideaScript("check volume first"));
+    const a = await harness.openSession("a");
+    const b = await harness.openSession("b");
+    await a.idle();
+    expect(ideasIn((await b.turn({ input: "other work" })).events)).toEqual([]);
+    expect(ideasIn((await harness.run({ input: "one-shot" })).events)).toEqual([]);
+    expect(await a.pendingIdeas()).toEqual(["check volume first"]);
+  });
+
+  test("newTask discards ideas prepared for the previous task", async () => {
+    const { harness } = build(ideaScript("check volume first"));
+    const session = await harness.openSession("s-new");
+    await session.turn({ input: "why did the export fail" });
+    await session.idle();
+    const result = await session.turn({ input: "different question", newTask: true });
+    expect(ideasIn(result.events)).toEqual([]);
+    expect(await session.pendingIdeas()).toEqual([]);
+  });
+
+  test("a later idle replaces earlier pending ideas", async () => {
+    let round = 0;
+    const { harness } = build((r) => (r.agent === "background" ? reply({ kind: "observation", content: `idea ${++round}` }) : reply()));
+    const session = await harness.openSession("s-replace");
+    await session.idle();
+    await session.idle();
+    expect(await session.pendingIdeas()).toEqual(["idea 2"]);
   });
 });
