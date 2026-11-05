@@ -1,0 +1,24 @@
+{
+  "name": "brain-harness",
+  "version": "0.2.0",
+  "description": "Proof-of-concept LLM agent harness: bounded workspace, cheap parallel specialists, an on-demand executive, a policy-gated actuator, cache-stable transcripts and two-speed memory behind provider-neutral IO ports.",
+  "private": true,
+  "type": "module",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts",
+    "./adapters/openai-compatible": "./src/adapters/openai-compatible.ts",
+    "./adapters/file-storage": "./src/adapters/file-storage.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "bun test",
+    "check": "bun run typecheck && bun test",
+    "chat": "bun examples/chat.ts"
+  },
+  "devDependencies": {
+    "@types/bun": "1.4.4",
+    "typescript": "5.9.3"
+  }
+}
