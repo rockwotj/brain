@@ -1,0 +1,16 @@
+{
+  "name": "brain",
+  "version": "0.0.1",
+  "description": "An LLM agent harness structured around human brain patterns (proof of concept)",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "demo": "bun examples/demo.ts",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "^5.6.0"
+  }
+}
